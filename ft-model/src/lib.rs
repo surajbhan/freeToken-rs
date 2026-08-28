@@ -772,6 +772,11 @@ impl Model {
         let lk = self.moe.cache.lookup(layer as u32, ids);
         let miss_ids: Vec<u32> = lk.misses.iter().map(|&(e, _)| e).collect();
         let (fetch_ids, cpu_ids) = split_misses(&miss_ids, self.moe.fraction);
+        // CPU-served misses never land in their assigned GPU slot: un-admit
+        // them or the next route becomes a false hit on stale slot contents.
+        for &e in &cpu_ids {
+            self.moe.cache.forget(layer as u32, e);
+        }
         let slot_of = |e: u32| lk.misses.iter().find(|&&(me, _)| me == e).unwrap().1;
         let wt_of = |e: u32| wts[ids.iter().position(|&i| i == e).unwrap()];
 

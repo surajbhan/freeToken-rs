@@ -107,6 +107,17 @@ impl SlotCache {
         best as u32
     }
 
+    /// Un-admit an entry whose slot was assigned by `lookup` but whose
+    /// weights were never actually copied in (e.g. a miss served by the CPU
+    /// path). Leaving it mapped would make the next route a false hit that
+    /// reads whatever the slot last held.
+    pub fn forget(&mut self, layer: u32, expert: u32) {
+        if let Some(slot) = self.map.remove(&(layer, expert)) {
+            self.slots[slot as usize] = None;
+            self.last_used[slot as usize] = 0;
+        }
+    }
+
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits_total + self.misses_total;
         if total == 0 {

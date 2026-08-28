@@ -238,6 +238,9 @@ fn main() -> Result<()> {
 
             let miss_ids: Vec<u32> = lk.misses.iter().map(|&(e, _)| e).collect();
             let (fetch_ids, cpu_ids) = split_misses(&miss_ids, fraction);
+            for &e in &cpu_ids {
+                cache.forget(layer as u32, e); // no weights copied for these
+            }
             let slot_of = |e: u32| lk.misses.iter().find(|&&(me, _)| me == e).unwrap().1;
 
             // 1) enqueue H2D for fetched misses on the copy stream
