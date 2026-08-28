@@ -37,6 +37,8 @@ fn main() -> Result<()> {
     let tok = Tokenizer::from_gguf(&g)?;
     let ctx = CudaContext::new(0)?;
     let mut model = Model::load(&g, &ctx, slots, fraction, 1)?;
+    model.gpu_routing = arg("groute", 0.0) != 0.0;
+    let graphed = arg("graph", 0.0) != 0.0;
     eprintln!(
         "loaded {} layers, {} experts, cache {slots} slots in {:.1}s",
         model.cfg.n_layers,
@@ -49,11 +51,15 @@ fn main() -> Result<()> {
     ids.extend(tok.encode_with_specials(&text));
     eprintln!("prompt: {} tokens", ids.len());
 
-    // prefill (sequential)
+    // prefill (sequential; on-device sampling, 4-byte downloads)
     let t1 = Instant::now();
-    let mut logits = Vec::new();
+    let mut next = 0u32;
     for &id in &ids {
-        logits = model.forward_token(id)?;
+        next = if graphed {
+            model.forward_sample_graphed(&[(0, id)], &[temp])?[0]
+        } else {
+            model.forward_sample(&[(0, id)], &[temp])?[0]
+        };
     }
     eprintln!(
         "prefill: {:.2}s ({:.0} ms/tok)",
@@ -64,41 +70,18 @@ fn main() -> Result<()> {
     // decode
     let t2 = Instant::now();
     let mut out_ids = Vec::new();
-    let mut rng = 0x1234_5678u64;
     for _ in 0..n {
-        let next = if temp <= 0.0 {
-            logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .unwrap()
-                .0 as u32
-        } else {
-            // temperature sampling
-            let mx = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            let probs: Vec<f32> = logits.iter().map(|&l| ((l - mx) / temp).exp()).collect();
-            let sum: f32 = probs.iter().sum();
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            let mut r = (rng as f64 / u64::MAX as f64) as f32 * sum;
-            let mut pick = 0;
-            for (i, &p) in probs.iter().enumerate() {
-                r -= p;
-                if r <= 0.0 {
-                    pick = i;
-                    break;
-                }
-            }
-            pick as u32
-        };
         if next == tok.eos || Some(next) == tok.eot {
             break;
         }
         out_ids.push(next);
         print!("{}", tok.decode(&[next]));
         std::io::stdout().flush()?;
-        logits = model.forward_token(next)?;
+        next = if graphed {
+            model.forward_sample_graphed(&[(0, next)], &[temp])?[0]
+        } else {
+            model.forward_sample(&[(0, next)], &[temp])?[0]
+        };
     }
     println!();
     let dt = t2.elapsed().as_secs_f64();

@@ -39,6 +39,23 @@ impl HostBanks {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.buf
     }
+
+    /// Device-visible address of the registered host memory (UVA): kernels
+    /// can read expert banks directly over PCIe without an explicit fetch.
+    pub fn device_ptr(&self) -> Result<u64> {
+        let mut dptr: sys::CUdeviceptr = 0;
+        let rc = unsafe {
+            sys::cuMemHostGetDevicePointer_v2(
+                &mut dptr,
+                self.buf.as_ptr() as *mut core::ffi::c_void,
+                0,
+            )
+        };
+        if rc != sys::CUresult::CUDA_SUCCESS {
+            bail!("cuMemHostGetDevicePointer failed: {rc:?}");
+        }
+        Ok(dptr as u64)
+    }
 }
 
 impl Drop for HostBanks {
@@ -74,6 +91,11 @@ pub struct Q4Gemv {
     dual_combine: CudaFunction,
     gemv_f32: CudaFunction,
     gather: CudaFunction,
+    grouped_v3_ptr: CudaFunction,
+    sample: CudaFunction,
+    topk: CudaFunction,
+    admit: CudaFunction,
+    promote: CudaFunction,
 }
 
 /// bytes per 32-element q8 activation block (f32 d, f32 s, 32x i8)
@@ -107,7 +129,12 @@ impl Q4Gemv {
         let dual_combine = module.load_function("dual_combine_rows")?;
         let gemv_f32 = module.load_function("gemv_f32_rows")?;
         let gather = module.load_function("gather_rows")?;
-        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn, grouped_v3_idx, reduce_pairs, rmsnorm_rows, add_rows, rmsnorm_heads, rope_heads, kv_append, attn_batch, dual_combine, gemv_f32, gather })
+        let grouped_v3_ptr = module.load_function("gemv_q4_0_grouped_v3_ptr")?;
+        let sample = module.load_function("sample_tokens")?;
+        let topk = module.load_function("topk_router")?;
+        let admit = module.load_function("lru_admit")?;
+        let promote = module.load_function("promote_experts")?;
+        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn, grouped_v3_idx, reduce_pairs, rmsnorm_rows, add_rows, rmsnorm_heads, rope_heads, kv_append, attn_batch, dual_combine, gemv_f32, gather, grouped_v3_ptr, sample, topk, admit, promote })
     }
 
     /// One launch computing y[e] = W_e x_e for every routed expert of a layer.
@@ -320,7 +347,7 @@ impl Q4Gemv {
         out: &mut CudaSlice<f32>,
         slot_arr: &CudaSlice<i32>,
         pos_arr: &CudaSlice<i32>,
-        start_arr: &CudaSlice<i32>,
+        window: usize,
         kv_dim: usize,
         hd: usize,
         group: usize,
@@ -331,15 +358,112 @@ impl Q4Gemv {
     ) -> Result<()> {
         let smem = max_ctx * 4;
         assert!(smem <= 48 * 1024);
-        let (kd, h, g, nh, ms) = (kv_dim as i32, hd as i32, group as i32, n_heads as i32, max_seq as i32);
+        let (w, kd, h, g, nh, ms) = (
+            window as i32,
+            kv_dim as i32,
+            hd as i32,
+            group as i32,
+            n_heads as i32,
+            max_seq as i32,
+        );
         let cfg = LaunchConfig {
             grid_dim: (n_heads as u32, n_seqs as u32, 1),
             block_dim: (128, 1, 1),
             shared_mem_bytes: smem as u32,
         };
         let mut lb = stream.launch_builder(&self.attn_batch);
-        lb.arg(kpool).arg(vpool).arg(q).arg(out).arg(slot_arr).arg(pos_arr).arg(start_arr)
-            .arg(&kd).arg(&h).arg(&g).arg(&nh).arg(&ms);
+        lb.arg(kpool).arg(vpool).arg(q).arg(out).arg(slot_arr).arg(pos_arr)
+            .arg(&w).arg(&kd).arg(&h).arg(&g).arg(&nh).arg(&ms);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// device top-k router: ids + softmaxed rescaled weights per sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn topk_router_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        logits: &CudaSlice<f32>,
+        expert_scale: &CudaSlice<f32>,
+        ids: &mut CudaSlice<i32>,
+        wts: &mut CudaSlice<f32>,
+        e_count: usize,
+        k: usize,
+        n_seqs: usize,
+    ) -> Result<()> {
+        assert!(e_count <= 1024 && k <= 32);
+        let (e, kk) = (e_count as i32, k as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (n_seqs as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.topk);
+        lb.arg(logits).arg(expert_scale).arg(ids).arg(wts).arg(&e).arg(&kk);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// device-side LRU admission over the expert slot cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lru_admit_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        ids: &CudaSlice<i32>,
+        layer: usize,
+        e_count: usize,
+        n_slots: usize,
+        cache_base: u64,
+        banks_base: u64,
+        expert_bytes: usize,
+        map: &mut CudaSlice<i32>,
+        slot_key: &mut CudaSlice<i32>,
+        slot_last: &mut CudaSlice<u32>,
+        clock: &mut CudaSlice<u32>,
+        bases: &mut CudaSlice<u64>,
+        promote_src: &mut CudaSlice<i32>,
+        promote_dst: &mut CudaSlice<i32>,
+        n_entries: usize,
+    ) -> Result<()> {
+        let (l, e, ns, eb, ne) = (
+            layer as i32,
+            e_count as i32,
+            n_slots as i32,
+            expert_bytes as u64,
+            n_entries as i32,
+        );
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.admit);
+        lb.arg(ids).arg(&l).arg(&e).arg(&ns).arg(&cache_base).arg(&banks_base).arg(&eb)
+            .arg(map).arg(slot_key).arg(slot_last).arg(clock)
+            .arg(bases).arg(promote_src).arg(promote_dst).arg(&ne);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// device-side promotion of missed experts into their slots (UVA copy).
+    pub fn promote_experts_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        promote_src: &CudaSlice<i32>,
+        promote_dst: &CudaSlice<i32>,
+        banks_base: u64,
+        cache_base: u64,
+        expert_bytes: usize,
+        n_entries: usize,
+    ) -> Result<()> {
+        let eb = expert_bytes as u64;
+        let cfg = LaunchConfig {
+            grid_dim: (96, n_entries as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.promote);
+        lb.arg(promote_src).arg(promote_dst).arg(&banks_base).arg(&cache_base).arg(&eb);
         unsafe { lb.launch(cfg)? };
         Ok(())
     }
@@ -368,6 +492,68 @@ impl Q4Gemv {
         };
         let mut lb = stream.launch_builder(&self.dual_combine);
         lb.arg(x).arg(shared_y).arg(routed_y).arg(w1).arg(w2).arg(w3).arg(&scalar).arg(&d).arg(&eps);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// v3 grouped GEMV over per-entry base POINTERS (u64): each entry's
+    /// weights live either in the VRAM slot cache or directly in pinned host
+    /// banks (UVA) — misses stream over PCIe inside the kernel, no explicit
+    /// fetch or sync required.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_grouped_q8_ptr(
+        &self,
+        stream: &Arc<CudaStream>,
+        bases: &CudaSlice<u64>,
+        bank_off: usize,
+        x_idx: &CudaSlice<i32>,
+        n_entries: usize,
+        q8: &CudaSlice<u8>,
+        q8_stride_blocks: usize,
+        y: &mut CudaSlice<f32>,
+        y_stride: usize,
+        n_rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        assert_eq!(k % 32, 0);
+        let nblocks = k / 32;
+        assert!(bases.len() >= n_entries && x_idx.len() >= n_entries);
+        assert!(y.len() >= n_entries * y_stride);
+        let off = bank_off as u64;
+        let (qs, ys) = (q8_stride_blocks as i32, y_stride as i32);
+        let (nr, ki) = (n_rows as i32, k as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows.div_ceil(4) as u32, n_entries as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: (nblocks * Q8_BLK) as u32,
+        };
+        let mut lb = stream.launch_builder(&self.grouped_v3_ptr);
+        lb.arg(bases).arg(&off).arg(x_idx).arg(q8).arg(&qs).arg(y).arg(&ys).arg(&nr).arg(&ki);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// fused greedy/Gumbel sampling over batched logits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_tokens_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        logits: &CudaSlice<f32>,
+        temps: &CudaSlice<f32>,
+        rng: &mut CudaSlice<u64>,
+        out: &mut CudaSlice<i32>,
+        vocab: usize,
+        cap: f32,
+        n_seqs: usize,
+    ) -> Result<()> {
+        let v = vocab as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (n_seqs as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.sample);
+        lb.arg(logits).arg(temps).arg(rng).arg(out).arg(&v).arg(&cap);
         unsafe { lb.launch(cfg)? };
         Ok(())
     }

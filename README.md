@@ -38,7 +38,9 @@ finish together.
 | freeToken-rs, first working build | 16.0 | 63 | CPU attention, f32 kernels |
 | freeToken-rs, profiled + optimized | 30.4 | 33 | dp4a kernels, rope tables, parallel router, fused MLP chain |
 | freeToken-rs, + GPU attention & q4 lm_head | 42.2 | 24 | f16 KV cache on GPU, flash-decode kernel, overlapped MLP/MoE |
-| freeToken-rs, GPU-resident decode | **46.8** | **21** | norms/rope/router/combine on device, pooled KV, 1 sync/layer |
+| freeToken-rs, GPU-resident decode | 46.8 | 21 | norms/rope/router/combine on device, pooled KV, 1 sync/layer |
+| freeToken-rs, UVA experts + GPU sampling | 62.9 | 16 | misses stream over PCIe inside the kernel; 4-byte/token download |
+| **freeToken-rs, CUDA-graph replay** | **64.8** | **15.4** | device LRU + topk; whole token = one graph launch |
 | Python FreeToken, Triton fallback (driver 550) | 68.0 | 14.7 | CUDA graphs, Triton attention |
 | Python FreeToken, native accel (driver 580) | 91.8 | 10.9 | flashinfer + sglang-kernel |
 
@@ -49,15 +51,20 @@ fewer per-layer syncs, continuous batching. The Python engine's remaining
 lead (native stack: 91.8 tok/s on the same GPU) is its CUDA graphs and fused
 launch structure, not the language.
 
+**GPU-poor hardware** (GTX 1650 4 GB laptop, driver 535): freeToken-rs runs the
+same 26B model at **8.9 tok/s** in hybrid mode (280-slot cache, CPU experts +
+PCIe streaming). Python FreeToken cannot start on this machine at all — its
+torch 2.11 pin is a CUDA-13 build requiring driver >= 580.
+
 ## Concurrency
 
 `serve` implements continuous batching: up to `batch=N` sequences decode as
 one batched forward per step (batched dense/expert/lm_head GEMVs via an
 activation-indirection kernel; per-slot KV caches; prefill on admission;
 finished sequences free their slot immediately). 8 concurrent requests
-complete in 5.5 s wall vs 9.1 s serialized, with max per-request latency
-down from 14 s to 5.5 s — batched output verified token-identical to
-single-stream decoding.
+complete in **3.1 s wall** on the graphed batched server (vs 9.1 s
+serialized), max per-request latency 14 s -> 3.1 s — batched output verified
+token-identical to single-stream decoding.
 
 ```
 cargo test --release          # unit + GPU parity tests

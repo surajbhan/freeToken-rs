@@ -95,9 +95,8 @@ struct ActiveSeq {
     slot: usize,
     tx: mpsc::Sender<Option<String>>,
     temperature: f32,
-    rng: u64,
     remaining: usize,
-    last_logits: Vec<f32>,
+    next_token: u32,
 }
 
 /// Continuous-batching worker: new requests are prefilled on admission (one
@@ -127,11 +126,15 @@ fn worker(mut model: Model, tok: Tokenizer, rx: mpsc::Receiver<GenJob>) {
             model.reset_slot(slot);
             let budget = model.cfg.max_seq.saturating_sub(job.max_new + 2);
             let prompt = &job.prompt_ids[..job.prompt_ids.len().min(budget)];
-            let mut logits = Vec::new();
-            let mut ok = true;
+            let mut next = 0u32;
+            let mut ok = !prompt.is_empty();
             for &id in prompt {
-                match model.forward_batch(&[(slot, id)]) {
-                    Ok(mut o) => logits = o.pop().unwrap(),
+                match if model.gpu_routing {
+                    model.forward_sample_graphed(&[(slot, id)], &[job.temperature])
+                } else {
+                    model.forward_sample(&[(slot, id)], &[job.temperature])
+                } {
+                    Ok(t) => next = t[0],
                     Err(e) => {
                         eprintln!("prefill error: {e:#}");
                         ok = false;
@@ -139,7 +142,7 @@ fn worker(mut model: Model, tok: Tokenizer, rx: mpsc::Receiver<GenJob>) {
                     }
                 }
             }
-            if !ok || logits.is_empty() {
+            if !ok {
                 let _ = job.tx.send(None);
                 free_slots.push(slot);
                 continue;
@@ -148,17 +151,17 @@ fn worker(mut model: Model, tok: Tokenizer, rx: mpsc::Receiver<GenJob>) {
                 slot,
                 tx: job.tx,
                 temperature: job.temperature,
-                rng: 0x9E37_79B9_7F4A_7C15,
                 remaining: job.max_new,
-                last_logits: logits,
+                next_token: next,
             });
         }
 
-        // one batched decode step
+        // one batched decode step (tokens pre-sampled on device)
         let mut reqs: Vec<(usize, u32)> = Vec::new();
+        let mut temps: Vec<f32> = Vec::new();
         let mut keep: Vec<bool> = Vec::with_capacity(active.len());
         for seq in active.iter_mut() {
-            let next = sample(&seq.last_logits, seq.temperature, &mut seq.rng);
+            let next = seq.next_token;
             let stop = next == tok.eos
                 || Some(next) == tok.eot
                 || seq.remaining == 0
@@ -169,6 +172,7 @@ fn worker(mut model: Model, tok: Tokenizer, rx: mpsc::Receiver<GenJob>) {
             } else {
                 seq.remaining -= 1;
                 reqs.push((seq.slot, next));
+                temps.push(seq.temperature);
                 keep.push(true);
             }
         }
@@ -183,10 +187,14 @@ fn worker(mut model: Model, tok: Tokenizer, rx: mpsc::Receiver<GenJob>) {
         if reqs.is_empty() {
             continue;
         }
-        match model.forward_batch(&reqs) {
-            Ok(outs) => {
-                for (seq, lg) in active.iter_mut().zip(outs) {
-                    seq.last_logits = lg;
+        match if model.gpu_routing {
+            model.forward_sample_graphed(&reqs, &temps)
+        } else {
+            model.forward_sample(&reqs, &temps)
+        } {
+            Ok(toks) => {
+                for (seq, t2) in active.iter_mut().zip(toks) {
+                    seq.next_token = t2;
                 }
             }
             Err(e) => {
@@ -339,7 +347,8 @@ fn main() -> anyhow::Result<()> {
     let tok2 = Tokenizer::from_gguf(&g)?;
     let ctx = CudaContext::new(0)?;
     let batch = arg("batch", 4.0) as usize;
-    let model = Model::load(&g, &ctx, slots, fraction, batch)?;
+    let mut model = Model::load(&g, &ctx, slots, fraction, batch)?;
+    model.gpu_routing = arg("groute", 0.0) != 0.0;
     drop(g);
     eprintln!("model loaded; serving on 0.0.0.0:{port}");
 

@@ -552,7 +552,7 @@ extern "C" __global__ void attn_decode_batch(
     float* __restrict__ out,
     const int* __restrict__ slot_arr,
     const int* __restrict__ pos_arr,      // pos (inclusive last index)
-    const int* __restrict__ start_arr,    // kv window start
+    int window,                            // 0 = full attention
     int kv_dim,
     int hd,
     int group,
@@ -563,8 +563,8 @@ extern "C" __global__ void attn_decode_batch(
     int h = blockIdx.x;
     int s = blockIdx.y;
     int g = h / group;
-    int kv_start = start_arr[s];
     int kv_end = pos_arr[s] + 1;
+    int kv_start = (window > 0 && kv_end > window) ? kv_end - window : 0;
     int n = kv_end - kv_start;
     const float* qh = q + (size_t)s * n_heads * hd + (size_t)h * hd;
     const __half* kc = reinterpret_cast<const __half*>(kpool)
@@ -890,4 +890,276 @@ extern "C" __global__ void gather_rows(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < row_len)
         dst[(size_t)s * row_len + i] = src[(size_t)s * src_stride + src_off + i];
+}
+
+// pointer-based variant of the v3 grouped GEMV: entry e's expert weights are
+// at bases[e] + bank_off (VRAM slot or UVA-mapped pinned host bank).
+extern "C" __global__ void gemv_q4_0_grouped_v3_ptr(
+    const unsigned long long* __restrict__ bases,
+    unsigned long long bank_off,
+    const int* __restrict__ x_idx,
+    const unsigned char* __restrict__ q8,
+    int q8_stride_blocks,
+    float* __restrict__ y,
+    int y_stride,
+    int n_rows,
+    int k)
+{
+    extern __shared__ unsigned char q8s[];
+    int e = blockIdx.y;
+    int nblocks = k / 32;
+    {
+        const unsigned char* src = q8 + (size_t)x_idx[e] * q8_stride_blocks * 40;
+        for (int i = threadIdx.x; i < nblocks * 40 / 4; i += blockDim.x)
+            reinterpret_cast<unsigned int*>(q8s)[i] =
+                reinterpret_cast<const unsigned int*>(src)[i];
+    }
+    __syncthreads();
+
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * 4 + warp;
+    if (row >= n_rows) return;
+    const unsigned char* wr = reinterpret_cast<const unsigned char*>(bases[e])
+                            + bank_off + (size_t)row * nblocks * 18;
+
+    float acc = 0.0f;
+    for (int b = lane; b < nblocks; b += 32) {
+        const unsigned short* p = reinterpret_cast<const unsigned short*>(wr + b * 18);
+        float d4 = __half2float(__ushort_as_half(p[0]));
+        const unsigned char* qb = q8s + b * 40;
+        float d8 = *reinterpret_cast<const float*>(qb);
+        float s8 = *reinterpret_cast<const float*>(qb + 4);
+        const int* x8 = reinterpret_cast<const int*>(qb + 8);
+        int isum = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            unsigned int g = (unsigned int)p[1 + 2 * i] | ((unsigned int)p[2 + 2 * i] << 16);
+            int lo = g & 0x0F0F0F0Fu;
+            int hi = (g >> 4) & 0x0F0F0F0Fu;
+            isum = __dp4a(lo, x8[i], isum);
+            isum = __dp4a(hi, x8[4 + i], isum);
+        }
+        acc += d4 * (d8 * (float)isum - 8.0f * s8);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    if (lane == 0) y[(size_t)e * y_stride + row] = acc;
+}
+
+// fused sampling: greedy argmax (softcap is monotonic -> skipped), or
+// Gumbel-argmax for temperature sampling over softcapped logits.
+// One block per sequence; logits [n_seqs, vocab].
+extern "C" __global__ void sample_tokens(
+    const float* __restrict__ logits,
+    const float* __restrict__ temps,     // per seq
+    unsigned long long* __restrict__ rng, // per seq xorshift state
+    int* __restrict__ out,
+    int vocab,
+    float cap)
+{
+    __shared__ float best_v[256];
+    __shared__ int best_i[256];
+    int s = blockIdx.x;
+    const float* lg = logits + (size_t)s * vocab;
+    float temp = temps[s];
+    unsigned long long st = rng[s] + (unsigned long long)(threadIdx.x + 1) * 0x9E3779B97F4A7C15ull;
+
+    float bv = -1e30f;
+    int bi = 0;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+        float v = lg[i];
+        if (temp > 0.0f) {
+            v = tanhf(v / cap) * cap / temp;
+            // per-candidate gumbel noise
+            st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+            float u = (float)(st >> 40) / 16777216.0f + 1e-9f;
+            v += -__logf(-__logf(u));
+        }
+        if (v > bv) { bv = v; bi = i; }
+    }
+    best_v[threadIdx.x] = bv;
+    best_i[threadIdx.x] = bi;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2 && best_v[threadIdx.x + s2] > best_v[threadIdx.x]) {
+            best_v[threadIdx.x] = best_v[threadIdx.x + s2];
+            best_i[threadIdx.x] = best_i[threadIdx.x + s2];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out[s] = best_i[0];
+        // advance the sequence's rng deterministically
+        unsigned long long r = rng[s];
+        r ^= r << 13; r ^= r >> 7; r ^= r << 17;
+        rng[s] = r;
+    }
+}
+
+// ---- device-side routing: topk, LRU admission, promotion ----
+
+// per-seq top-k of router logits + softmax + per-expert rescale.
+// One block per sequence; E <= 1024. Writes ids [s*k..] and weights.
+extern "C" __global__ void topk_router(
+    const float* __restrict__ logits,   // [n_seqs, E]
+    const float* __restrict__ expert_scale, // [E]
+    int* __restrict__ ids,              // [n_seqs, k]
+    float* __restrict__ wts,            // [n_seqs, k]
+    int e_count,
+    int k)
+{
+    __shared__ float sv[1024];
+    __shared__ float red_v[128];
+    __shared__ int red_i[128];
+    __shared__ float sel_v[32];
+    __shared__ int sel_i[32];
+    int s = blockIdx.x;
+    const float* lg = logits + (size_t)s * e_count;
+    for (int i = threadIdx.x; i < e_count; i += blockDim.x) sv[i] = lg[i];
+    __syncthreads();
+    for (int j = 0; j < k; ++j) {
+        float bv = -1e30f;
+        int bi = 0;
+        for (int i = threadIdx.x; i < e_count; i += blockDim.x) {
+            if (sv[i] > bv) { bv = sv[i]; bi = i; }
+        }
+        red_v[threadIdx.x] = bv;
+        red_i[threadIdx.x] = bi;
+        __syncthreads();
+        for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+            if (threadIdx.x < s2 && red_v[threadIdx.x + s2] > red_v[threadIdx.x]) {
+                red_v[threadIdx.x] = red_v[threadIdx.x + s2];
+                red_i[threadIdx.x] = red_i[threadIdx.x + s2];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            sel_v[j] = red_v[0];
+            sel_i[j] = red_i[0];
+            sv[red_i[0]] = -1e30f;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float mx = sel_v[0];
+        float denom = 0.0f;
+        for (int j = 0; j < k; ++j) {
+            sel_v[j] = __expf(sel_v[j] - mx);
+            denom += sel_v[j];
+        }
+        for (int j = 0; j < k; ++j) {
+            ids[(size_t)s * k + j] = sel_i[j];
+            wts[(size_t)s * k + j] = sel_v[j] / denom * expert_scale[sel_i[j]];
+        }
+    }
+}
+
+// device-side global LRU admission. Single block. For each of n_entries
+// routed (layer,expert) keys: hit -> VRAM slot base; miss -> evict LRU slot,
+// remap, emit the pinned host bank base (UVA read this step) and a promote
+// record filling the slot for future steps.
+extern "C" __global__ void lru_admit(
+    const int* __restrict__ ids,        // [n_entries] expert ids
+    int layer,
+    int e_count,
+    int n_slots,
+    unsigned long long cache_base,
+    unsigned long long banks_base,
+    unsigned long long expert_bytes,
+    int* __restrict__ map,              // [L*E] -> slot or -1
+    int* __restrict__ slot_key,         // [n_slots] -> key or -1
+    unsigned int* __restrict__ slot_last, // [n_slots]
+    unsigned int* __restrict__ clock_ctr, // [1]
+    unsigned long long* __restrict__ bases, // [n_entries] out
+    int* __restrict__ promote_src_key,  // [n_entries] out (-1 = none)
+    int* __restrict__ promote_dst_slot, // [n_entries] out
+    int n_entries)
+{
+    __shared__ unsigned int red_v[128];
+    __shared__ int red_i[128];
+    // pass 1: touch every hit first so this step's hits can never be chosen
+    // as eviction victims by this step's misses
+    if (threadIdx.x == 0) {
+        for (int t = 0; t < n_entries; ++t) {
+            int key = layer * e_count + ids[t];
+            int slot = map[key];
+            if (slot >= 0) {
+                unsigned int c = ++clock_ctr[0];
+                slot_last[slot] = c;
+                bases[t] = cache_base + (unsigned long long)slot * expert_bytes;
+                promote_src_key[t] = -1;
+            } else {
+                promote_src_key[t] = -2; // marks "needs admission" for pass 2
+            }
+        }
+    }
+    __syncthreads();
+    for (int t = 0; t < n_entries; ++t) {
+        if (promote_src_key[t] != -2) continue;
+        int key = layer * e_count + ids[t];
+        int slot = map[key];
+        if (slot >= 0) {
+            // duplicate expert admitted earlier this pass (another sequence)
+            if (threadIdx.x == 0) {
+                bases[t] = cache_base + (unsigned long long)slot * expert_bytes;
+                promote_src_key[t] = -1;
+            }
+        } else {
+            // parallel LRU scan
+            unsigned int bv = 0xFFFFFFFFu;
+            int bi = 0;
+            for (int i = threadIdx.x; i < n_slots; i += blockDim.x) {
+                if (slot_last[i] < bv) { bv = slot_last[i]; bi = i; }
+            }
+            red_v[threadIdx.x] = bv;
+            red_i[threadIdx.x] = bi;
+            __syncthreads();
+            for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+                if (threadIdx.x < s2 && red_v[threadIdx.x + s2] < red_v[threadIdx.x]) {
+                    red_v[threadIdx.x] = red_v[threadIdx.x + s2];
+                    red_i[threadIdx.x] = red_i[threadIdx.x + s2];
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) {
+                int victim = red_i[0];
+                int old = slot_key[victim];
+                if (old >= 0) map[old] = -1;
+                slot_key[victim] = key;
+                map[key] = victim;
+                unsigned int c = ++clock_ctr[0];
+                slot_last[victim] = c;
+                bases[t] = banks_base + (unsigned long long)key * expert_bytes;
+                promote_src_key[t] = key;
+                promote_dst_slot[t] = victim;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// promote missed experts into their assigned slots: entry t copies
+// expert_bytes from the pinned host bank (UVA) into the VRAM slot.
+// Grid: (chunks, n_entries); entries with promote_src_key < 0 no-op.
+extern "C" __global__ void promote_experts(
+    const int* __restrict__ promote_src_key,
+    const int* __restrict__ promote_dst_slot,
+    unsigned long long banks_base,
+    unsigned long long cache_base,
+    unsigned long long expert_bytes)
+{
+    int t = blockIdx.y;
+    int key = promote_src_key[t];
+    if (key < 0) return;
+    const unsigned int* src = reinterpret_cast<const unsigned int*>(
+        banks_base + (unsigned long long)key * expert_bytes);
+    unsigned int* dst = reinterpret_cast<unsigned int*>(
+        cache_base + (unsigned long long)promote_dst_slot[t] * expert_bytes);
+    size_t n = expert_bytes / 4;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += (size_t)gridDim.x * blockDim.x)
+        dst[i] = src[i];
 }

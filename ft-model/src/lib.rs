@@ -167,6 +167,7 @@ pub struct LayerWeights {
     pub post_ffw2_d: CudaSlice<f32>,
     /// router weights with per-dim scale and H^-0.5 folded in
     pub router_wf_d: CudaSlice<f32>,
+    pub expert_scale_d: CudaSlice<f32>,
 }
 
 pub struct MoeEngine {
@@ -311,6 +312,23 @@ pub struct Model {
     sc_pf: CudaSlice<f32>,
     sc_ri: CudaSlice<f32>,
     final_norm_d: CudaSlice<f32>,
+    temps_dev: CudaSlice<f32>,
+    rng_dev: CudaSlice<u64>,
+    tok_out_dev: CudaSlice<i32>,
+    want_sample: bool,
+    /// fully device-side routing/admission (graph-compatible path)
+    pub gpu_routing: bool,
+    n_slots: usize,
+    lru_map: CudaSlice<i32>,
+    lru_slot_key: CudaSlice<i32>,
+    lru_slot_last: CudaSlice<u32>,
+    lru_clock: CudaSlice<u32>,
+    moe_ids_dev: CudaSlice<i32>,
+    promote_src_dev: CudaSlice<i32>,
+    promote_dst_dev: CudaSlice<i32>,
+    /// instantiated CUDA graph per batch size (raw CUgraphExec as usize)
+    graph_exec: Vec<usize>,
+    captured_events: Vec<cudarc::driver::CudaEvent>,
     inv_freq_swa: Vec<f32>,
     inv_freq_full: Vec<f32>,
     pub max_batch: usize,
@@ -321,6 +339,11 @@ pub struct Model {
     pair_xidx: CudaSlice<i32>,
     pair_wts: CudaSlice<f32>,
     pair_seq: CudaSlice<i32>,
+    pair_bases: CudaSlice<u64>,
+    pair_bases_h: Vec<u64>,
+    banks_dptr: u64,
+    cache_dptr: u64,
+    pending_fetch: Option<cudarc::driver::CudaEvent>,
     pair_slots_h: Vec<i32>,
     pair_xidx_h: Vec<i32>,
     pair_wts_h: Vec<f32>,
@@ -403,7 +426,12 @@ impl Model {
         max_batch: usize,
     ) -> Result<Self> {
         let cfg = Config::from_gguf(g)?;
-        let stream = ctx.default_stream();
+        // We order the compute/copy streams explicitly with events; cudarc's
+        // automatic per-buffer event tracking would inject waits on
+        // pre-capture events and break CUDA-graph capture.
+        unsafe { ctx.disable_event_tracking() };
+        // non-default stream: the legacy default stream cannot be graph-captured
+        let stream = ctx.new_stream()?;
         let copy_stream = ctx.new_stream()?;
         let gemv = Q4Gemv::new(ctx)?;
 
@@ -473,6 +501,7 @@ impl Model {
                 post_ffw1_d: stream.memcpy_stod(&post_ffw1)?,
                 post_ffw2_d: stream.memcpy_stod(&post_ffw2)?,
                 router_wf_d: stream.memcpy_stod(&router_wf)?,
+                expert_scale_d: stream.memcpy_stod(&to_f32(g, &t("ffn_down_exps.scale"))?)?,
                 attn_norm,
                 q_norm,
                 k_norm,
@@ -554,7 +583,7 @@ impl Model {
         let kv_dims: Vec<usize> = (0..cfg.n_layers)
             .map(|l| cfg.kv_heads[l] * cfg.head_dim(l))
             .collect();
-        Ok(Self {
+        let mut m = Self {
             prof: Profile::default(),
             zero_slot: stream.alloc_zeros::<i32>(1)?,
             xbufs: HashMap::new(),
@@ -586,6 +615,32 @@ impl Model {
             sc_pf: stream.alloc_zeros::<f32>(max_batch * HIDDEN)?,
             sc_ri: stream.alloc_zeros::<f32>(max_batch * HIDDEN)?,
             final_norm_d: stream.memcpy_stod(&final_norm)?,
+            temps_dev: stream.alloc_zeros::<f32>(max_batch)?,
+            rng_dev: {
+                let seeds: Vec<u64> = (0..max_batch as u64)
+                    .map(|i| 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i + 1))
+                    .collect();
+                stream.memcpy_stod(&seeds)?
+            },
+            tok_out_dev: stream.alloc_zeros::<i32>(max_batch)?,
+            want_sample: false,
+            gpu_routing: false,
+            n_slots: cache_slots,
+            lru_map: {
+                let v = vec![-1i32; cfg.n_layers * cfg.n_experts];
+                stream.memcpy_stod(&v)?
+            },
+            lru_slot_key: {
+                let v = vec![-1i32; cache_slots];
+                stream.memcpy_stod(&v)?
+            },
+            lru_slot_last: stream.alloc_zeros::<u32>(cache_slots)?,
+            lru_clock: stream.alloc_zeros::<u32>(1)?,
+            moe_ids_dev: stream.alloc_zeros::<i32>(max_batch * cfg.topk)?,
+            promote_src_dev: stream.alloc_zeros::<i32>(max_batch * cfg.topk)?,
+            promote_dst_dev: stream.alloc_zeros::<i32>(max_batch * cfg.topk)?,
+            graph_exec: vec![0; max_batch + 1],
+            captured_events: Vec::new(),
             inv_freq_swa: build_inv_freq(cfg.head_dim_swa, cfg.rope_base_swa),
             inv_freq_full: build_inv_freq(cfg.head_dim_full, cfg.rope_base_full),
             max_batch,
@@ -594,6 +649,11 @@ impl Model {
             pair_xidx: stream.alloc_zeros::<i32>(max_batch * cfg.topk)?,
             pair_wts: stream.alloc_zeros::<f32>(max_batch * cfg.topk)?,
             pair_seq: stream.alloc_zeros::<i32>(max_batch * cfg.topk)?,
+            pair_bases: stream.alloc_zeros::<u64>(max_batch * cfg.topk)?,
+            pair_bases_h: Vec::new(),
+            banks_dptr: 0,
+            cache_dptr: 0,
+            pending_fetch: None,
             pair_slots_h: Vec::new(),
             pair_xidx_h: Vec::new(),
             pair_wts_h: Vec::new(),
@@ -620,7 +680,19 @@ impl Model {
             gemv,
             stream,
             copy_stream,
-        })
+        };
+        m.init_uva()?;
+        Ok(m)
+    }
+
+    /// resolve device-visible base addresses for the slot cache and the
+    /// pinned host banks (UVA) — enables pointer-based expert GEMVs.
+    fn init_uva(&mut self) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        self.banks_dptr = self.moe.banks.device_ptr()?;
+        let (p, _g) = self.moe.cache_buf.device_ptr(&self.stream);
+        self.cache_dptr = p as u64;
+        Ok(())
     }
 
     /// debug: read back the dense_idx device buffer
@@ -638,6 +710,400 @@ impl Model {
     pub fn forward_token(&mut self, token: u32) -> Result<Vec<f32>> {
         let mut out = self.forward_batch(&[(0, token)])?;
         Ok(out.pop().unwrap())
+    }
+
+    /// Pure-GPU decode stack for `nb` sequences (gpu_routing only): every op
+    /// from the residual stream through sampling, no CPU work, fixed launch
+    /// shapes — the CUDA-graph body. Inputs (x_res, pos/slot/temps, pair
+    /// maps) must already be uploaded.
+    fn enqueue_stack(&mut self, nb: usize) -> Result<()> {
+        let cfg = self.cfg.clone();
+        anyhow::ensure!(self.gpu_routing, "enqueue_stack requires gpu_routing");
+        for l in 0..cfg.n_layers {
+            let hd = cfg.head_dim(l);
+            let kvh = cfg.kv_heads[l];
+            let q_rows = cfg.n_heads * hd;
+            let kv_dim = kvh * hd;
+            let qkv_rows = self.layers[l].qkv_rows;
+            let group = cfg.n_heads / kvh;
+
+            self.gemv.rmsnorm_rows_dev(
+                &self.stream, &self.x_res, Some(&self.layers[l].attn_norm_d),
+                &mut self.sc_a, HIDDEN, cfg.eps, nb,
+            )?;
+            {
+                let q8 = self.q8bufs.get_mut(&HIDDEN).unwrap();
+                self.gemv.quantize_q8(&self.stream, &self.sc_a, HIDDEN, q8, HIDDEN, nb)?;
+            }
+            {
+                let q8 = self.q8bufs.get(&HIDDEN).unwrap();
+                let yd = self.ybufs.get_mut(&qkv_rows).unwrap();
+                self.gemv.gemv_grouped_q8_idx(
+                    &self.stream, &self.layers[l].qkv, 0, 0, &self.zeros_b, &self.dense_idx,
+                    nb, q8, HIDDEN / 32, yd, qkv_rows, qkv_rows, HIDDEN,
+                )?;
+            }
+            {
+                let yd = self.ybufs.get_mut(&qkv_rows).unwrap();
+                let n_all = nb * qkv_rows;
+                {
+                    let mut qv = yd.slice_mut(0..n_all);
+                    self.gemv.rmsnorm_heads_dev(
+                        &self.stream, &mut qv, &self.layers[l].q_norm_d, true, hd, cfg.eps,
+                        qkv_rows, cfg.n_heads, nb,
+                    )?;
+                }
+                {
+                    let mut kv2 = yd.slice_mut(q_rows..n_all);
+                    self.gemv.rmsnorm_heads_dev(
+                        &self.stream, &mut kv2, &self.layers[l].k_norm_d, true, hd, cfg.eps,
+                        qkv_rows, kvh, nb,
+                    )?;
+                }
+                {
+                    let mut vv = yd.slice_mut(q_rows + kv_dim..n_all);
+                    self.gemv.rmsnorm_heads_dev(
+                        &self.stream, &mut vv, &self.layers[l].k_norm_d, false, hd, cfg.eps,
+                        qkv_rows, kvh, nb,
+                    )?;
+                }
+                let inv_freq = if cfg.swa[l] { &self.inv_freq_swa_d } else { &self.inv_freq_full_d };
+                {
+                    let mut qv = yd.slice_mut(0..n_all);
+                    self.gemv.rope_heads_dev(
+                        &self.stream, &mut qv, inv_freq, &self.pos_dev, hd, cfg.n_heads,
+                        qkv_rows, nb,
+                    )?;
+                }
+                {
+                    let mut kv2 = yd.slice_mut(q_rows..n_all);
+                    self.gemv.rope_heads_dev(
+                        &self.stream, &mut kv2, inv_freq, &self.pos_dev, hd, kvh, qkv_rows, nb,
+                    )?;
+                }
+            }
+            {
+                let yd = self.ybufs.get(&qkv_rows).unwrap();
+                self.gemv.kv_append_dev(
+                    &self.stream, yd, &mut self.k_pool[l], &self.slot_dev, &self.pos_dev,
+                    q_rows, qkv_rows, kv_dim, cfg.max_seq, nb,
+                )?;
+                self.gemv.kv_append_dev(
+                    &self.stream, yd, &mut self.v_pool[l], &self.slot_dev, &self.pos_dev,
+                    q_rows + kv_dim, qkv_rows, kv_dim, cfg.max_seq, nb,
+                )?;
+                self.gemv
+                    .gather_rows_dev(&self.stream, yd, &mut self.attn_out_dev, qkv_rows, 0, q_rows, nb)?;
+            }
+            self.gemv.attn_decode_batch_dev(
+                &self.stream, &self.k_pool[l], &self.v_pool[l], &self.attn_out_dev,
+                &mut self.sc_o, &self.slot_dev, &self.pos_dev,
+                if cfg.swa[l] { cfg.window } else { 0 },
+                kv_dim, hd, group, cfg.n_heads, cfg.max_seq, nb,
+                cfg.max_seq, // fixed smem for graph stability
+            )?;
+            {
+                let q8 = self.q8bufs.get_mut(&q_rows).unwrap();
+                self.gemv
+                    .quantize_q8(&self.stream, &self.sc_o, q_rows, q8, q_rows, nb)?;
+            }
+            {
+                let q8 = self.q8bufs.get(&q_rows).unwrap();
+                let yd = self.ybufs.get_mut(&HIDDEN).unwrap();
+                self.gemv.gemv_grouped_q8_idx(
+                    &self.stream, &self.layers[l].o, 0, 0, &self.zeros_b, &self.dense_idx,
+                    nb, q8, q_rows / 32, yd, HIDDEN, HIDDEN, q_rows,
+                )?;
+            }
+            {
+                let yd = self.ybufs.get(&HIDDEN).unwrap();
+                self.gemv.rmsnorm_rows_dev(
+                    &self.stream, yd, Some(&self.layers[l].post_attn_d), &mut self.sc_a,
+                    HIDDEN, cfg.eps, nb,
+                )?;
+            }
+            self.gemv
+                .add_rows_dev(&self.stream, &mut self.x_res, &self.sc_a, HIDDEN, nb)?;
+
+            self.gemv.rmsnorm_rows_dev(
+                &self.stream, &self.x_res, Some(&self.layers[l].ffn_norm_d), &mut self.sc_pf,
+                HIDDEN, cfg.eps, nb,
+            )?;
+            self.gemv.rmsnorm_rows_dev(
+                &self.stream, &self.x_res, Some(&self.layers[l].pre_ffw2_d), &mut self.sc_ri,
+                HIDDEN, cfg.eps, nb,
+            )?;
+            let gu_rows = 2 * cfg.ffn;
+            self.gemv
+                .quantize_q8(&self.stream, &self.sc_pf, HIDDEN, &mut self.q8_preff, HIDDEN, nb)?;
+            {
+                let yd = self.ybufs.get_mut(&gu_rows).unwrap();
+                self.gemv.gemv_grouped_q8_idx(
+                    &self.stream, &self.layers[l].gate_up, 0, 0, &self.zeros_b, &self.dense_idx,
+                    nb, &self.q8_preff, HIDDEN / 32, yd, gu_rows, gu_rows, HIDDEN,
+                )?;
+            }
+            {
+                let yd = self.ybufs.get(&gu_rows).unwrap();
+                self.gemv
+                    .gelu_mul_grouped(&self.stream, yd, &mut self.act_dev, cfg.ffn, nb)?;
+            }
+            {
+                let q8a = self.q8bufs.get_mut(&cfg.ffn).unwrap();
+                self.gemv
+                    .quantize_q8(&self.stream, &self.act_dev, cfg.ffn, q8a, cfg.ffn, nb)?;
+            }
+            {
+                let q8a = self.q8bufs.get(&cfg.ffn).unwrap();
+                let yd = self.ybufs.get_mut(&HIDDEN).unwrap();
+                self.gemv.gemv_grouped_q8_idx(
+                    &self.stream, &self.layers[l].down, 0, 0, &self.zeros_b, &self.dense_idx,
+                    nb, q8a, cfg.ffn / 32, yd, HIDDEN, HIDDEN, cfg.ffn,
+                )?;
+            }
+            self.gemv
+                .rmsnorm_rows_dev(&self.stream, &self.x_res, None, &mut self.sc_a, HIDDEN, cfg.eps, nb)?;
+            self.gemv.gemv_f32_rows_dev(
+                &self.stream, &self.layers[l].router_wf_d, &self.sc_a,
+                &mut self.router_logits_dev, HIDDEN, cfg.n_experts, nb,
+            )?;
+            self.gemv
+                .quantize_q8(&self.stream, &self.sc_ri, HIDDEN, &mut self.q8_routed, HIDDEN, nb)?;
+            self.gemv.topk_router_dev(
+                &self.stream, &self.router_logits_dev, &self.layers[l].expert_scale_d,
+                &mut self.moe_ids_dev, &mut self.pair_wts, cfg.n_experts, cfg.topk, nb,
+            )?;
+            if let Some(ev) = self.pending_fetch.take() {
+                self.stream.wait(&ev)?;
+                self.captured_events.push(ev);
+            }
+            self.gemv.lru_admit_dev(
+                &self.stream, &self.moe_ids_dev, l, cfg.n_experts, self.n_slots,
+                self.cache_dptr, self.banks_dptr, self.moe.eb,
+                &mut self.lru_map, &mut self.lru_slot_key, &mut self.lru_slot_last,
+                &mut self.lru_clock, &mut self.pair_bases,
+                &mut self.promote_src_dev, &mut self.promote_dst_dev, nb * cfg.topk,
+            )?;
+            let ev_a = self.stream.record_event(None)?;
+            self.copy_stream.wait(&ev_a)?;
+            self.captured_events.push(ev_a);
+            self.gemv.promote_experts_dev(
+                &self.copy_stream, &self.promote_src_dev, &self.promote_dst_dev,
+                self.banks_dptr, self.cache_dptr, self.moe.eb, nb * cfg.topk,
+            )?;
+            self.pending_fetch = Some(self.copy_stream.record_event(None)?);
+
+            let n_pairs = nb * cfg.topk;
+            {
+                let mut r = self.routed_out_dev.slice_mut(0..nb * HIDDEN);
+                self.stream.memset_zeros(&mut r)?;
+            }
+            let gu_rows_e = 2 * cfg.moe_inter;
+            self.gemv.gemv_grouped_q8_ptr(
+                &self.stream, &self.pair_bases, 0, &self.pair_xidx, n_pairs,
+                &self.q8_routed, HIDDEN / 32, &mut self.pair_y_gu, gu_rows_e,
+                gu_rows_e, HIDDEN,
+            )?;
+            self.gemv.gelu_mul_grouped(
+                &self.stream, &self.pair_y_gu, &mut self.pair_act, cfg.moe_inter, n_pairs,
+            )?;
+            self.gemv.quantize_q8(
+                &self.stream, &self.pair_act, cfg.moe_inter, &mut self.pair_act_q8,
+                cfg.moe_inter, n_pairs,
+            )?;
+            self.gemv.gemv_grouped_q8_ptr(
+                &self.stream, &self.pair_bases, self.moe.gu_bytes, &self.dense_idx,
+                n_pairs, &self.pair_act_q8, cfg.moe_inter / 32, &mut self.pair_y_down,
+                HIDDEN, HIDDEN, cfg.moe_inter,
+            )?;
+            self.gemv.reduce_pairs_weighted(
+                &self.stream, &self.pair_y_down, &self.pair_wts, &self.pair_seq,
+                &mut self.routed_out_dev, HIDDEN, n_pairs, nb,
+            )?;
+            {
+                let sh2 = self.ybufs.get(&HIDDEN).unwrap();
+                self.gemv.dual_combine_dev(
+                    &self.stream, &mut self.x_res, sh2, &self.routed_out_dev,
+                    &self.layers[l].post_ffw1_d, &self.layers[l].post_ffw2_d,
+                    &self.layers[l].post_ffw_d, self.layers[l].layer_scalar,
+                    HIDDEN, cfg.eps, nb,
+                )?;
+            }
+        }
+        // join the last layer's promote before finishing the step
+        if let Some(ev) = self.pending_fetch.take() {
+            self.stream.wait(&ev)?;
+            self.captured_events.push(ev);
+        }
+        // final norm + lm_head + sample
+        self.gemv.rmsnorm_rows_dev(
+            &self.stream, &self.x_res, Some(&self.final_norm_d), &mut self.sc_a,
+            HIDDEN, cfg.eps, nb,
+        )?;
+        self.gemv
+            .quantize_q8(&self.stream, &self.sc_a, HIDDEN, &mut self.q8_preff, HIDDEN, nb)?;
+        self.gemv.gemv_grouped_q8_idx(
+            &self.stream, &self.lm_head_q4, 0, 0, &self.zeros_b, &self.dense_idx,
+            nb, &self.q8_preff, HIDDEN / 32, &mut self.logits_dev, cfg.vocab,
+            cfg.vocab, HIDDEN,
+        )?;
+        self.gemv.sample_tokens_dev(
+            &self.stream, &self.logits_dev, &self.temps_dev, &mut self.rng_dev,
+            &mut self.tok_out_dev, cfg.vocab, cfg.softcap, nb,
+        )?;
+        Ok(())
+    }
+
+    /// allocate every lazy scratch buffer the decode stack touches (must be
+    /// done before graph capture — allocation is not capturable).
+    fn ensure_buffers(&mut self) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let mut q8_keys = vec![HIDDEN, cfg.ffn];
+        let mut y_keys = vec![HIDDEN, 2 * cfg.ffn];
+        for l in 0..cfg.n_layers {
+            let q_rows = cfg.n_heads * cfg.head_dim(l);
+            q8_keys.push(q_rows);
+            y_keys.push(self.layers[l].qkv_rows);
+        }
+        for k in q8_keys {
+            if !self.q8bufs.contains_key(&k) {
+                self.q8bufs.insert(
+                    k,
+                    self.stream
+                        .alloc_zeros::<u8>(self.max_batch * k / 32 * ft_cuda::Q8_BLK)?,
+                );
+            }
+        }
+        for r in y_keys {
+            if !self.ybufs.contains_key(&r) {
+                self.ybufs
+                    .insert(r, self.stream.alloc_zeros::<f32>(self.max_batch * r)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn upload_inputs(&mut self, reqs: &[(usize, u32)], temps: &[f32]) -> Result<()> {
+        let nb = reqs.len();
+        let cfg_topk = self.cfg.topk;
+        let scale = (HIDDEN as f32).sqrt();
+        let erb = q6k::row_bytes(HIDDEN);
+        let mut h_all = vec![0f32; nb * HIDDEN];
+        for (i, &(slot, token)) in reqs.iter().enumerate() {
+            anyhow::ensure!(self.seq_pos[slot] < self.cfg.max_seq, "context overflow");
+            let row = &mut h_all[i * HIDDEN..(i + 1) * HIDDEN];
+            q6k::dequantize_row(
+                &self.embed_cpu[token as usize * erb..(token as usize + 1) * erb],
+                row,
+            );
+            for v in row.iter_mut() {
+                *v *= scale;
+            }
+        }
+        {
+            let mut xr = self.x_res.slice_mut(0..nb * HIDDEN);
+            self.stream.memcpy_htod(&h_all[..nb * HIDDEN], &mut xr)?;
+        }
+        let pos_h: Vec<i32> = reqs.iter().map(|&(sl, _)| self.seq_pos[sl] as i32).collect();
+        let slot_h: Vec<i32> = reqs.iter().map(|&(sl, _)| sl as i32).collect();
+        {
+            let mut pd = self.pos_dev.slice_mut(0..nb);
+            self.stream.memcpy_htod(&pos_h, &mut pd)?;
+            let mut sd = self.slot_dev.slice_mut(0..nb);
+            self.stream.memcpy_htod(&slot_h, &mut sd)?;
+            let mut td = self.temps_dev.slice_mut(0..nb);
+            self.stream.memcpy_htod(temps, &mut td)?;
+        }
+        let xi: Vec<i32> = (0..nb * cfg_topk).map(|p2| (p2 / cfg_topk) as i32).collect();
+        {
+            let mut xd = self.pair_xidx.slice_mut(0..nb * cfg_topk);
+            self.stream.memcpy_htod(&xi, &mut xd)?;
+            let mut sq = self.pair_seq.slice_mut(0..nb * cfg_topk);
+            self.stream.memcpy_htod(&xi, &mut sq)?;
+        }
+        Ok(())
+    }
+
+    /// Graph-replayed decode step: builds a CUDA graph of the whole token on
+    /// first use per batch size, then replays it — one graph launch instead
+    /// of ~750 kernel launches.
+    pub fn forward_sample_graphed(
+        &mut self,
+        reqs: &[(usize, u32)],
+        temps: &[f32],
+    ) -> Result<Vec<u32>> {
+        use cudarc::driver::sys as cus;
+        let nb = reqs.len();
+        anyhow::ensure!(self.gpu_routing, "graphed path requires gpu_routing");
+        self.ensure_buffers()?;
+        self.upload_inputs(reqs, temps)?;
+        // drain any pre-capture cross-stream state: a pending event recorded
+        // outside the capture would poison it (STREAM_CAPTURE_ISOLATION)
+        if let Some(ev) = self.pending_fetch.take() {
+            self.stream.wait(&ev)?;
+        }
+        self.stream.synchronize()?;
+        self.copy_stream.synchronize()?;
+        if self.graph_exec[nb] == 0 {
+            // build: capture the pure-GPU stack
+            let raw = cudarc::driver::sys::CUstream::from(self.stream.cu_stream());
+            unsafe {
+                let rc = cus::cuStreamBeginCapture_v2(
+                    raw,
+                    cus::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                );
+                anyhow::ensure!(rc == cus::CUresult::CUDA_SUCCESS, "begin capture: {rc:?}");
+            }
+            self.enqueue_stack(nb)?;
+            let mut graph: cus::CUgraph = std::ptr::null_mut();
+            unsafe {
+                let rc = cus::cuStreamEndCapture(raw, &mut graph);
+                anyhow::ensure!(rc == cus::CUresult::CUDA_SUCCESS, "end capture: {rc:?}");
+                let mut exec: cus::CUgraphExec = std::ptr::null_mut();
+                let rc = cus::cuGraphInstantiateWithFlags(&mut exec, graph, 0);
+                anyhow::ensure!(rc == cus::CUresult::CUDA_SUCCESS, "instantiate: {rc:?}");
+                cus::cuGraphDestroy(graph);
+                self.graph_exec[nb] = exec as usize;
+            }
+        }
+        unsafe {
+            let raw = cudarc::driver::sys::CUstream::from(self.stream.cu_stream());
+            let rc = cus::cuGraphLaunch(self.graph_exec[nb] as cus::CUgraphExec, raw);
+            anyhow::ensure!(rc == cus::CUresult::CUDA_SUCCESS, "graph launch: {rc:?}");
+        }
+        let mut toks = vec![0i32; nb];
+        self.stream
+            .memcpy_dtoh(&self.tok_out_dev.slice(0..nb), &mut toks)?;
+        self.stream.synchronize()?;
+        for &(slot, _) in reqs {
+            self.seq_pos[slot] += 1;
+        }
+        self.prof.tokens += nb as u64;
+        Ok(toks.into_iter().map(|t| t as u32).collect())
+    }
+
+    /// Like forward_batch but samples on-device and downloads only the next
+    /// token per sequence (4 bytes) instead of full logits. temps: per-entry
+    /// sampling temperature (<=0 = greedy).
+    pub fn forward_sample(
+        &mut self,
+        reqs: &[(usize, u32)],
+        temps: &[f32],
+    ) -> Result<Vec<u32>> {
+        let nb = reqs.len();
+        assert_eq!(temps.len(), nb);
+        self.want_sample = true;
+        {
+            let mut td = self.temps_dev.slice_mut(0..nb);
+            self.stream.memcpy_htod(temps, &mut td)?;
+        }
+        let _ = self.forward_batch(reqs)?;
+        self.want_sample = false;
+        let mut toks = vec![0i32; nb];
+        self.stream
+            .memcpy_dtoh(&self.tok_out_dev.slice(0..nb), &mut toks)?;
+        self.stream.synchronize()?;
+        Ok(toks.into_iter().map(|t| t as u32).collect())
     }
 
     /// One decode step for a set of (batch_slot, token) entries — the
@@ -714,6 +1180,14 @@ impl Model {
         }
 
         q8buf!(HIDDEN);
+        if self.gpu_routing {
+            // constant pair->sequence mapping for fixed nb
+            let xi: Vec<i32> = (0..nb * cfg.topk).map(|p| (p / cfg.topk) as i32).collect();
+            let mut xd = self.pair_xidx.slice_mut(0..nb * cfg.topk);
+            self.stream.memcpy_htod(&xi, &mut xd)?;
+            let mut sq = self.pair_seq.slice_mut(0..nb * cfg.topk);
+            self.stream.memcpy_htod(&xi, &mut sq)?;
+        }
         let mut routed_in_all = vec![0f32; nb * HIDDEN];
         let mut router_logits = vec![0f32; nb * cfg.n_experts];
 
@@ -725,21 +1199,6 @@ impl Model {
             let qkv_rows = self.layers[l].qkv_rows;
             let group = cfg.n_heads / kvh;
             let max_pos = reqs.iter().map(|&(sl, _)| self.seq_pos[sl]).max().unwrap();
-            let start_h: Vec<i32> = reqs
-                .iter()
-                .map(|&(sl, _)| {
-                    if cfg.swa[l] {
-                        (self.seq_pos[sl] + 1).saturating_sub(cfg.window) as i32
-                    } else {
-                        0
-                    }
-                })
-                .collect();
-            {
-                let mut st = self.start_dev.slice_mut(0..nb);
-                self.stream.memcpy_htod(&start_h, &mut st)?;
-            }
-
             // --- attention block, device-side ---
             t = Instant::now();
             ybuf!(qkv_rows);
@@ -814,7 +1273,8 @@ impl Model {
             }
             self.gemv.attn_decode_batch_dev(
                 &self.stream, &self.k_pool[l], &self.v_pool[l], &self.attn_out_dev,
-                &mut self.sc_o, &self.slot_dev, &self.pos_dev, &self.start_dev,
+                &mut self.sc_o, &self.slot_dev, &self.pos_dev,
+                if cfg.swa[l] { cfg.window } else { 0 },
                 kv_dim, hd, group, cfg.n_heads, cfg.max_seq, nb, max_pos + 1,
             )?;
             lap!(attn_cpu_us);
@@ -894,6 +1354,72 @@ impl Model {
             )?;
             lap!(shared_mlp_us);
 
+            if self.gpu_routing {
+                // === fully device-side routing: no per-layer sync ===
+                self.gemv
+                    .quantize_q8(&self.stream, &self.sc_ri, HIDDEN, &mut self.q8_routed, HIDDEN, nb)?;
+                self.gemv.topk_router_dev(
+                    &self.stream, &self.router_logits_dev, &self.layers[l].expert_scale_d,
+                    &mut self.moe_ids_dev, &mut self.pair_wts, cfg.n_experts, cfg.topk, nb,
+                )?;
+                if let Some(ev) = self.pending_fetch.take() {
+                    self.stream.wait(&ev)?;
+                }
+                self.gemv.lru_admit_dev(
+                    &self.stream, &self.moe_ids_dev, l, cfg.n_experts, self.n_slots,
+                    self.cache_dptr, self.banks_dptr, self.moe.eb,
+                    &mut self.lru_map, &mut self.lru_slot_key, &mut self.lru_slot_last,
+                    &mut self.lru_clock, &mut self.pair_bases,
+                    &mut self.promote_src_dev, &mut self.promote_dst_dev, nb * cfg.topk,
+                )?;
+                let ev_a = self.stream.record_event(None)?;
+                self.copy_stream.wait(&ev_a)?;
+                self.gemv.promote_experts_dev(
+                    &self.copy_stream, &self.promote_src_dev, &self.promote_dst_dev,
+                    self.banks_dptr, self.cache_dptr, self.moe.eb, nb * cfg.topk,
+                )?;
+                self.pending_fetch = Some(self.copy_stream.record_event(None)?);
+
+                let n_pairs = nb * cfg.topk;
+                {
+                    let mut r = self.routed_out_dev.slice_mut(0..nb * HIDDEN);
+                    self.stream.memset_zeros(&mut r)?;
+                }
+                let gu_rows_e = 2 * cfg.moe_inter;
+                self.gemv.gemv_grouped_q8_ptr(
+                    &self.stream, &self.pair_bases, 0, &self.pair_xidx, n_pairs,
+                    &self.q8_routed, HIDDEN / 32, &mut self.pair_y_gu, gu_rows_e,
+                    gu_rows_e, HIDDEN,
+                )?;
+                self.gemv.gelu_mul_grouped(
+                    &self.stream, &self.pair_y_gu, &mut self.pair_act, cfg.moe_inter, n_pairs,
+                )?;
+                self.gemv.quantize_q8(
+                    &self.stream, &self.pair_act, cfg.moe_inter, &mut self.pair_act_q8,
+                    cfg.moe_inter, n_pairs,
+                )?;
+                self.gemv.gemv_grouped_q8_ptr(
+                    &self.stream, &self.pair_bases, self.moe.gu_bytes, &self.dense_idx,
+                    n_pairs, &self.pair_act_q8, cfg.moe_inter / 32, &mut self.pair_y_down,
+                    HIDDEN, HIDDEN, cfg.moe_inter,
+                )?;
+                self.gemv.reduce_pairs_weighted(
+                    &self.stream, &self.pair_y_down, &self.pair_wts, &self.pair_seq,
+                    &mut self.routed_out_dev, HIDDEN, n_pairs, nb,
+                )?;
+                {
+                    let sh2 = self.ybufs.get(&HIDDEN).unwrap();
+                    self.gemv.dual_combine_dev(
+                        &self.stream, &mut self.x_res, sh2, &self.routed_out_dev,
+                        &self.layers[l].post_ffw1_d, &self.layers[l].post_ffw2_d,
+                        &self.layers[l].post_ffw_d, self.layers[l].layer_scalar,
+                        HIDDEN, cfg.eps, nb,
+                    )?;
+                }
+                lap!(moe_us);
+                continue;
+            }
+
             // --- the one sync per layer: router logits + routed_in download ---
             {
                 let rl = self.router_logits_dev.slice(0..nb * cfg.n_experts);
@@ -926,11 +1452,19 @@ impl Model {
             // --- routed experts: batched pairs ---
             self.gemv
                 .quantize_q8(&self.stream, &self.sc_ri, HIDDEN, &mut self.q8_routed, HIDDEN, nb)?;
-            self.pair_slots_h.clear();
+            // hits read the VRAM slot; misses read the pinned host bank over
+            // UVA this step while a background promote fills the slot for
+            // future steps. The promote is only awaited at the NEXT layer's
+            // moe section, so nothing here blocks on PCIe.
+            if let Some(ev) = self.pending_fetch.take() {
+                self.stream.wait(&ev)?;
+            }
+            self.pair_bases_h.clear();
             self.pair_xidx_h.clear();
             self.pair_wts_h.clear();
             self.pair_seq_h.clear();
             let mut cpu_pairs: Vec<(usize, u32, f32)> = Vec::new();
+            let mut any_fetch = false;
             for (i, ids) in all_ids.iter().enumerate() {
                 let lk = self.moe.cache.lookup(l as u32, ids);
                 let miss_ids: Vec<u32> = lk.misses.iter().map(|&(e, _)| e).collect();
@@ -951,30 +1485,39 @@ impl Model {
                         .slice_mut(cslot * self.moe.eb..(cslot + 1) * self.moe.eb);
                     self.copy_stream
                         .memcpy_htod(&hs[off..off + self.moe.eb], &mut dst)?;
+                    any_fetch = true;
                 }
+                let fetch_set: Vec<u32> = fetch_ids.clone();
                 for &(e, cslot) in lk
                     .hits
                     .iter()
                     .chain(fetch_ids.iter().map(|&e| (e, slot_of(e))).collect::<Vec<_>>().iter())
                 {
                     let w = all_wts[i][ids.iter().position(|&x2| x2 == e).unwrap()];
-                    self.pair_slots_h.push(cslot as i32);
+                    let base = if fetch_set.contains(&e) {
+                        // freshly missed: read host bank via UVA this step
+                        self.banks_dptr + ((l * cfg.n_experts + e as usize) * self.moe.eb) as u64
+                    } else {
+                        self.cache_dptr + (cslot as usize * self.moe.eb) as u64
+                    };
+                    self.pair_bases_h.push(base);
                     self.pair_xidx_h.push(i as i32);
                     self.pair_wts_h.push(w);
                     self.pair_seq_h.push(i as i32);
                 }
             }
-            let ev = self.copy_stream.record_event(None)?;
-            self.stream.wait(&ev)?;
-            let n_pairs = self.pair_slots_h.len();
+            if any_fetch {
+                self.pending_fetch = Some(self.copy_stream.record_event(None)?);
+            }
+            let n_pairs = self.pair_bases_h.len();
             {
                 let mut r = self.routed_out_dev.slice_mut(0..nb * HIDDEN);
                 self.stream.memset_zeros(&mut r)?;
             }
             if n_pairs > 0 {
                 {
-                    let mut sd = self.pair_slots.slice_mut(0..n_pairs);
-                    self.stream.memcpy_htod(&self.pair_slots_h, &mut sd)?;
+                    let mut bd = self.pair_bases.slice_mut(0..n_pairs);
+                    self.stream.memcpy_htod(&self.pair_bases_h, &mut bd)?;
                     let mut xd = self.pair_xidx.slice_mut(0..n_pairs);
                     self.stream.memcpy_htod(&self.pair_xidx_h, &mut xd)?;
                     let mut wd = self.pair_wts.slice_mut(0..n_pairs);
@@ -983,10 +1526,10 @@ impl Model {
                     self.stream.memcpy_htod(&self.pair_seq_h, &mut qd)?;
                 }
                 let gu_rows_e = 2 * cfg.moe_inter;
-                self.gemv.gemv_grouped_q8_idx(
-                    &self.stream, &self.moe.cache_buf, self.moe.eb, 0, &self.pair_slots,
-                    &self.pair_xidx, n_pairs, &self.q8_routed, HIDDEN / 32,
-                    &mut self.pair_y_gu, gu_rows_e, gu_rows_e, HIDDEN,
+                self.gemv.gemv_grouped_q8_ptr(
+                    &self.stream, &self.pair_bases, 0, &self.pair_xidx, n_pairs,
+                    &self.q8_routed, HIDDEN / 32, &mut self.pair_y_gu, gu_rows_e,
+                    gu_rows_e, HIDDEN,
                 )?;
                 self.gemv.gelu_mul_grouped(
                     &self.stream, &self.pair_y_gu, &mut self.pair_act, cfg.moe_inter, n_pairs,
@@ -995,10 +1538,10 @@ impl Model {
                     &self.stream, &self.pair_act, cfg.moe_inter, &mut self.pair_act_q8,
                     cfg.moe_inter, n_pairs,
                 )?;
-                self.gemv.gemv_grouped_q8_idx(
-                    &self.stream, &self.moe.cache_buf, self.moe.eb, self.moe.gu_bytes,
-                    &self.pair_slots, &self.dense_idx, n_pairs, &self.pair_act_q8,
-                    cfg.moe_inter / 32, &mut self.pair_y_down, HIDDEN, HIDDEN, cfg.moe_inter,
+                self.gemv.gemv_grouped_q8_ptr(
+                    &self.stream, &self.pair_bases, self.moe.gu_bytes, &self.dense_idx,
+                    n_pairs, &self.pair_act_q8, cfg.moe_inter / 32, &mut self.pair_y_down,
+                    HIDDEN, HIDDEN, cfg.moe_inter,
                 )?;
                 self.gemv.reduce_pairs_weighted(
                     &self.stream, &self.pair_y_down, &self.pair_wts, &self.pair_seq,
@@ -1074,19 +1617,29 @@ impl Model {
             cfg.vocab, HIDDEN,
         )?;
         lap!(combine_us);
-        let mut logits_all = vec![0f32; nb * cfg.vocab];
-        self.stream
-            .memcpy_dtoh(&self.logits_dev.slice(0..nb * cfg.vocab), &mut logits_all)?;
-        self.stream.synchronize()?;
         let cap = cfg.softcap;
         let mut out = Vec::with_capacity(nb);
-        for (i, &(slot, _)) in reqs.iter().enumerate() {
-            let mut lg = logits_all[i * cfg.vocab..(i + 1) * cfg.vocab].to_vec();
-            for v in lg.iter_mut() {
-                *v = (*v / cap).tanh() * cap;
+        if self.want_sample {
+            self.gemv.sample_tokens_dev(
+                &self.stream, &self.logits_dev, &self.temps_dev, &mut self.rng_dev,
+                &mut self.tok_out_dev, cfg.vocab, cap, nb,
+            )?;
+            for &(slot, _) in reqs {
+                self.seq_pos[slot] += 1;
             }
-            out.push(lg);
-            self.seq_pos[slot] += 1;
+        } else {
+            let mut logits_all = vec![0f32; nb * cfg.vocab];
+            self.stream
+                .memcpy_dtoh(&self.logits_dev.slice(0..nb * cfg.vocab), &mut logits_all)?;
+            self.stream.synchronize()?;
+            for (i, &(slot, _)) in reqs.iter().enumerate() {
+                let mut lg = logits_all[i * cfg.vocab..(i + 1) * cfg.vocab].to_vec();
+                for v in lg.iter_mut() {
+                    *v = (*v / cap).tanh() * cap;
+                }
+                out.push(lg);
+                self.seq_pos[slot] += 1;
+            }
         }
         self.prof.tokens += nb as u64;
         lap!(lm_head_us);
