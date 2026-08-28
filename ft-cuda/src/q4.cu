@@ -543,6 +543,76 @@ extern "C" __global__ void gemv_q6_k_q8(
     if (sub == 0) y[row] = acc;
 }
 
+// batched decode attention over the pooled KV cache: grid (n_heads, n_seqs);
+// per-seq slot/pos/kv_start arrays. q/out are [n_seqs, n_heads*hd].
+extern "C" __global__ void attn_decode_batch(
+    const unsigned short* __restrict__ kpool, // [max_batch, max_seq, kv_dim] f16 bits
+    const unsigned short* __restrict__ vpool,
+    const float* __restrict__ q,
+    float* __restrict__ out,
+    const int* __restrict__ slot_arr,
+    const int* __restrict__ pos_arr,      // pos (inclusive last index)
+    const int* __restrict__ start_arr,    // kv window start
+    int kv_dim,
+    int hd,
+    int group,
+    int n_heads,
+    int max_seq)
+{
+    extern __shared__ float sc[];
+    int h = blockIdx.x;
+    int s = blockIdx.y;
+    int g = h / group;
+    int kv_start = start_arr[s];
+    int kv_end = pos_arr[s] + 1;
+    int n = kv_end - kv_start;
+    const float* qh = q + (size_t)s * n_heads * hd + (size_t)h * hd;
+    const __half* kc = reinterpret_cast<const __half*>(kpool)
+                     + (size_t)slot_arr[s] * max_seq * kv_dim;
+    const __half* vc = reinterpret_cast<const __half*>(vpool)
+                     + (size_t)slot_arr[s] * max_seq * kv_dim;
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const __half* kt = kc + (size_t)(kv_start + i) * kv_dim + (size_t)g * hd;
+        float sv = 0.0f;
+        for (int d = 0; d < hd; ++d) sv += qh[d] * __half2float(kt[d]);
+        sc[i] = sv;
+    }
+    __syncthreads();
+    __shared__ float red[128];
+    float m = -1e30f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, sc[i]);
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s2]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float e2 = __expf(sc[i] - m);
+        sc[i] = e2;
+        sum += e2;
+    }
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] += red[threadIdx.x + s2];
+        __syncthreads();
+    }
+    float inv = 1.0f / red[0];
+    __syncthreads();
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        const __half* v0 = vc + (size_t)kv_start * kv_dim + (size_t)g * hd + d;
+        for (int i = 0; i < n; ++i)
+            acc += sc[i] * __half2float(v0[(size_t)i * kv_dim]);
+        out[(size_t)s * n_heads * hd + (size_t)h * hd + d] = acc * inv;
+    }
+}
+
 // ---- decode attention (bs=1): one block per query head ----
 // K/V cached as f16 [max_seq, kv_dim]; scores staged in dynamic smem
 // (ctx * 4B). Two-pass softmax; GQA maps query head h -> kv head h/group.
@@ -608,4 +678,216 @@ extern "C" __global__ void attn_decode(
             acc += sc[i] * __half2float(v0[(size_t)i * kv_dim]);
         out[(size_t)h * hd + d] = acc * inv;
     }
+}
+
+// ---- GPU-residency kernels: norms, rope, combine (batched, one row/block) ----
+
+// y[e] = rmsnorm(x[e]) * w   (w null-> no scale). x,y [n, dim].
+extern "C" __global__ void rmsnorm_rows(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float* __restrict__ y,
+    int dim,
+    float eps,
+    int has_w)
+{
+    extern __shared__ float sh[];
+    int e = blockIdx.x;
+    const float* xe = x + (size_t)e * dim;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = xe[i];
+        ss += v * v;
+    }
+    sh[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) sh[threadIdx.x] += sh[threadIdx.x + s2];
+        __syncthreads();
+    }
+    float r = rsqrtf(sh[0] / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        y[(size_t)e * dim + i] = xe[i] * r * (has_w ? w[i] : 1.0f);
+}
+
+// x[e] += a[e]  (residual add), batched rows
+extern "C" __global__ void add_rows(
+    float* __restrict__ x, const float* __restrict__ a, int dim)
+{
+    int e = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) x[(size_t)e * dim + i] += a[(size_t)e * dim + i];
+}
+
+// per-head rmsnorm over a section of batched qkv rows: sequence s's heads
+// live at x + s*seq_stride + head*hd. Grid: n_seqs * heads_per_seq.
+extern "C" __global__ void rmsnorm_heads(
+    float* __restrict__ x,
+    const float* __restrict__ w,
+    int hd,
+    float eps,
+    int has_w,
+    int seq_stride,
+    int heads_per_seq)
+{
+    extern __shared__ float sh[];
+    int e = blockIdx.x;
+    int seq = e / heads_per_seq;
+    int head = e % heads_per_seq;
+    float* xe = x + (size_t)seq * seq_stride + (size_t)head * hd;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        float v = xe[i];
+        ss += v * v;
+    }
+    sh[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) sh[threadIdx.x] += sh[threadIdx.x + s2];
+        __syncthreads();
+    }
+    float r = rsqrtf(sh[0] / hd + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x)
+        xe[i] *= r * (has_w ? w[i] : 1.0f);
+}
+
+// NeoX rope over a section of batched qkv rows (same addressing as
+// rmsnorm_heads); pos per sequence from pos_arr.
+extern "C" __global__ void rope_heads(
+    float* __restrict__ x,
+    const float* __restrict__ inv_freq, // [hd/2]
+    const int* __restrict__ pos_arr,    // [n_seqs]
+    int hd,
+    int heads_per_seq,
+    int seq_stride)
+{
+    int e = blockIdx.x;
+    int seq = e / heads_per_seq;
+    int pos = pos_arr[seq];
+    float* xe = x + (size_t)seq * seq_stride + (size_t)(e % heads_per_seq) * hd;
+    int half = hd / 2;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        float th = pos * inv_freq[i];
+        float sn = __sinf(th), cs = __cosf(th);
+        float a = xe[i], b = xe[i + half];
+        xe[i] = a * cs - b * sn;
+        xe[i + half] = a * sn + b * cs;
+    }
+}
+
+// append k/v sections of batched qkv rows into the pooled f16 KV cache:
+// seq s (grid.y) copies qkv[s*seq_stride + sec_off .. +kv_dim] (f32) into
+// pool[slot_arr[s]*max_seq*kv_dim + pos_arr[s]*kv_dim ..] as f16.
+extern "C" __global__ void kv_append(
+    const float* __restrict__ qkv,
+    unsigned short* __restrict__ pool,
+    const int* __restrict__ slot_arr,
+    const int* __restrict__ pos_arr,
+    int sec_off,
+    int seq_stride,
+    int kv_dim,
+    int max_seq)
+{
+    int s = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_dim) return;
+    float v = qkv[(size_t)s * seq_stride + sec_off + i];
+    size_t dst = ((size_t)slot_arr[s] * max_seq + (size_t)pos_arr[s]) * kv_dim + i;
+    pool[dst] = __half_as_ushort(__float2half(v));
+}
+
+// gemma dual-rmsnorm combine + residual + layer scalar, batched rows:
+// x[e] = (x[e] + rms(rms(shared[e])*w1 + rms(routed[e])*w2)*w3) * scalar
+extern "C" __global__ void dual_combine_rows(
+    float* __restrict__ x,
+    const float* __restrict__ shared_y,
+    const float* __restrict__ routed_y,
+    const float* __restrict__ w1,
+    const float* __restrict__ w2,
+    const float* __restrict__ w3,
+    float scalar,
+    int dim,
+    float eps)
+{
+    extern __shared__ float sh[];
+    float* buf = sh + blockDim.x; // dim floats scratch for combined
+    int e = blockIdx.x;
+    const float* s1 = shared_y + (size_t)e * dim;
+    const float* s2 = routed_y + (size_t)e * dim;
+
+    float ss1 = 0.0f, ss2 = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        ss1 += s1[i] * s1[i];
+        ss2 += s2[i] * s2[i];
+    }
+    sh[threadIdx.x] = ss1;
+    __syncthreads();
+    for (int s3 = blockDim.x / 2; s3 > 0; s3 >>= 1) {
+        if (threadIdx.x < s3) sh[threadIdx.x] += sh[threadIdx.x + s3];
+        __syncthreads();
+    }
+    float r1 = rsqrtf(sh[0] / dim + eps);
+    __syncthreads();
+    sh[threadIdx.x] = ss2;
+    __syncthreads();
+    for (int s3 = blockDim.x / 2; s3 > 0; s3 >>= 1) {
+        if (threadIdx.x < s3) sh[threadIdx.x] += sh[threadIdx.x + s3];
+        __syncthreads();
+    }
+    float r2 = rsqrtf(sh[0] / dim + eps);
+    __syncthreads();
+
+    float ssc = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float c = s1[i] * r1 * w1[i] + s2[i] * r2 * w2[i];
+        buf[i] = c;
+        ssc += c * c;
+    }
+    sh[threadIdx.x] = ssc;
+    __syncthreads();
+    for (int s3 = blockDim.x / 2; s3 > 0; s3 >>= 1) {
+        if (threadIdx.x < s3) sh[threadIdx.x] += sh[threadIdx.x + s3];
+        __syncthreads();
+    }
+    float r3 = rsqrtf(sh[0] / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        size_t o = (size_t)e * dim + i;
+        x[o] = (x[o] + buf[i] * r3 * w3[i]) * scalar;
+    }
+}
+
+// small f32 GEMV for the router: y[s][r] = dot(W[r], x[s]), W [n_rows, dim]
+// f32 (scales pre-folded). Grid: (n_rows, n_seqs), one warp-ish block per row.
+extern "C" __global__ void gemv_f32_rows(
+    const float* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int dim,
+    int n_rows)
+{
+    __shared__ float sh[128];
+    int r = blockIdx.x;
+    int s = blockIdx.y;
+    const float* wr = w + (size_t)r * dim;
+    const float* xs = x + (size_t)s * dim;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) acc += wr[i] * xs[i];
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) sh[threadIdx.x] += sh[threadIdx.x + s2];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[(size_t)s * n_rows + r] = sh[0];
+}
+
+// strided row gather: dst[s*row_len + i] = src[s*src_stride + src_off + i]
+extern "C" __global__ void gather_rows(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int src_stride, int src_off, int row_len)
+{
+    int s = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < row_len)
+        dst[(size_t)s * row_len + i] = src[(size_t)s * src_stride + src_off + i];
 }

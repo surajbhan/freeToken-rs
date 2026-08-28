@@ -65,6 +65,15 @@ pub struct Q4Gemv {
     attn: CudaFunction,
     grouped_v3_idx: CudaFunction,
     reduce_pairs: CudaFunction,
+    rmsnorm_rows: CudaFunction,
+    add_rows: CudaFunction,
+    rmsnorm_heads: CudaFunction,
+    rope_heads: CudaFunction,
+    kv_append: CudaFunction,
+    attn_batch: CudaFunction,
+    dual_combine: CudaFunction,
+    gemv_f32: CudaFunction,
+    gather: CudaFunction,
 }
 
 /// bytes per 32-element q8 activation block (f32 d, f32 s, 32x i8)
@@ -89,7 +98,16 @@ impl Q4Gemv {
         let attn = module.load_function("attn_decode")?;
         let grouped_v3_idx = module.load_function("gemv_q4_0_grouped_v3_idx")?;
         let reduce_pairs = module.load_function("reduce_pairs_weighted")?;
-        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn, grouped_v3_idx, reduce_pairs })
+        let rmsnorm_rows = module.load_function("rmsnorm_rows")?;
+        let add_rows = module.load_function("add_rows")?;
+        let rmsnorm_heads = module.load_function("rmsnorm_heads")?;
+        let rope_heads = module.load_function("rope_heads")?;
+        let kv_append = module.load_function("kv_append")?;
+        let attn_batch = module.load_function("attn_decode_batch")?;
+        let dual_combine = module.load_function("dual_combine_rows")?;
+        let gemv_f32 = module.load_function("gemv_f32_rows")?;
+        let gather = module.load_function("gather_rows")?;
+        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn, grouped_v3_idx, reduce_pairs, rmsnorm_rows, add_rows, rmsnorm_heads, rope_heads, kv_append, attn_batch, dual_combine, gemv_f32, gather })
     }
 
     /// One launch computing y[e] = W_e x_e for every routed expert of a layer.
@@ -163,6 +181,239 @@ impl Q4Gemv {
         };
         let mut lb = stream.launch_builder(&self.attn);
         lb.arg(kc).arg(vc).arg(q).arg(out).arg(&a).arg(&b).arg(&c).arg(&d).arg(&e);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+
+    /// y[e] = rmsnorm(x[e]) * w over n batched rows. w=None -> unscaled.
+    pub fn rmsnorm_rows_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        w: Option<&CudaSlice<f32>>,
+        y: &mut CudaSlice<f32>,
+        dim: usize,
+        eps: f32,
+        n: usize,
+    ) -> Result<()> {
+        let (d, hw) = (dim as i32, w.is_some() as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 128 * 4,
+        };
+        let wref = w.unwrap_or(x);
+        let mut lb = stream.launch_builder(&self.rmsnorm_rows);
+        lb.arg(x).arg(wref).arg(y).arg(&d).arg(&eps).arg(&hw);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// x[e] += a[e] over n rows of `dim`.
+    pub fn add_rows_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &mut CudaSlice<f32>,
+        a: &CudaSlice<f32>,
+        dim: usize,
+        n: usize,
+    ) -> Result<()> {
+        let d = dim as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (dim.div_ceil(256) as u32, n as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.add_rows);
+        lb.arg(x).arg(a).arg(&d);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// per-head rmsnorm on a section of batched qkv rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_heads_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &mut CudaViewMut<'_, f32>,
+        w: &CudaSlice<f32>,
+        has_w: bool,
+        hd: usize,
+        eps: f32,
+        seq_stride: usize,
+        heads_per_seq: usize,
+        n_seqs: usize,
+    ) -> Result<()> {
+        let (h, hw, ss, hp) = (hd as i32, has_w as i32, seq_stride as i32, heads_per_seq as i32);
+        let cfg = LaunchConfig {
+            grid_dim: ((n_seqs * heads_per_seq) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 128 * 4,
+        };
+        let mut lb = stream.launch_builder(&self.rmsnorm_heads);
+        lb.arg(x).arg(w).arg(&h).arg(&eps).arg(&hw).arg(&ss).arg(&hp);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// NeoX rope on a section of batched qkv rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_heads_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &mut CudaViewMut<'_, f32>,
+        inv_freq: &CudaSlice<f32>,
+        pos_arr: &CudaSlice<i32>,
+        hd: usize,
+        heads_per_seq: usize,
+        seq_stride: usize,
+        n_seqs: usize,
+    ) -> Result<()> {
+        let (h, hp, ss) = (hd as i32, heads_per_seq as i32, seq_stride as i32);
+        let cfg = LaunchConfig {
+            grid_dim: ((n_seqs * heads_per_seq) as u32, 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.rope_heads);
+        lb.arg(x).arg(inv_freq).arg(pos_arr).arg(&h).arg(&hp).arg(&ss);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// append k or v sections into the pooled f16 KV cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_append_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        qkv: &CudaSlice<f32>,
+        pool: &mut CudaSlice<u16>,
+        slot_arr: &CudaSlice<i32>,
+        pos_arr: &CudaSlice<i32>,
+        sec_off: usize,
+        seq_stride: usize,
+        kv_dim: usize,
+        max_seq: usize,
+        n_seqs: usize,
+    ) -> Result<()> {
+        let (so, ss, kd, ms) = (sec_off as i32, seq_stride as i32, kv_dim as i32, max_seq as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (kv_dim.div_ceil(256) as u32, n_seqs as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.kv_append);
+        lb.arg(qkv).arg(pool).arg(slot_arr).arg(pos_arr).arg(&so).arg(&ss).arg(&kd).arg(&ms);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// batched decode attention over the pooled KV cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_batch_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        kpool: &CudaSlice<u16>,
+        vpool: &CudaSlice<u16>,
+        q: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        slot_arr: &CudaSlice<i32>,
+        pos_arr: &CudaSlice<i32>,
+        start_arr: &CudaSlice<i32>,
+        kv_dim: usize,
+        hd: usize,
+        group: usize,
+        n_heads: usize,
+        max_seq: usize,
+        n_seqs: usize,
+        max_ctx: usize,
+    ) -> Result<()> {
+        let smem = max_ctx * 4;
+        assert!(smem <= 48 * 1024);
+        let (kd, h, g, nh, ms) = (kv_dim as i32, hd as i32, group as i32, n_heads as i32, max_seq as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (n_heads as u32, n_seqs as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: smem as u32,
+        };
+        let mut lb = stream.launch_builder(&self.attn_batch);
+        lb.arg(kpool).arg(vpool).arg(q).arg(out).arg(slot_arr).arg(pos_arr).arg(start_arr)
+            .arg(&kd).arg(&h).arg(&g).arg(&nh).arg(&ms);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// gemma dual-rmsnorm combine + residual + scalar, batched rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dual_combine_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &mut CudaSlice<f32>,
+        shared_y: &CudaSlice<f32>,
+        routed_y: &CudaSlice<f32>,
+        w1: &CudaSlice<f32>,
+        w2: &CudaSlice<f32>,
+        w3: &CudaSlice<f32>,
+        scalar: f32,
+        dim: usize,
+        eps: f32,
+        n: usize,
+    ) -> Result<()> {
+        let d = dim as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: ((128 + dim) * 4) as u32,
+        };
+        let mut lb = stream.launch_builder(&self.dual_combine);
+        lb.arg(x).arg(shared_y).arg(routed_y).arg(w1).arg(w2).arg(w3).arg(&scalar).arg(&d).arg(&eps);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// strided row gather (e.g. q sections of qkv rows -> contiguous).
+    pub fn gather_rows_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: &CudaSlice<f32>,
+        dst: &mut CudaSlice<f32>,
+        src_stride: usize,
+        src_off: usize,
+        row_len: usize,
+        n_seqs: usize,
+    ) -> Result<()> {
+        let (ss, so, rl) = (src_stride as i32, src_off as i32, row_len as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (row_len.div_ceil(256) as u32, n_seqs as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.gather);
+        lb.arg(src).arg(dst).arg(&ss).arg(&so).arg(&rl);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// f32 router GEMV: y[s][r] = dot(W[r], x[s]).
+    pub fn gemv_f32_rows_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: &CudaSlice<f32>,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        dim: usize,
+        n_rows: usize,
+        n_seqs: usize,
+    ) -> Result<()> {
+        let (d, nr) = (dim as i32, n_rows as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows as u32, n_seqs as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 128 * 4,
+        };
+        let mut lb = stream.launch_builder(&self.gemv_f32);
+        lb.arg(w).arg(x).arg(y).arg(&d).arg(&nr);
         unsafe { lb.launch(cfg)? };
         Ok(())
     }

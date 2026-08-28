@@ -37,7 +37,8 @@ finish together.
 |---|---|---|---|
 | freeToken-rs, first working build | 16.0 | 63 | CPU attention, f32 kernels |
 | freeToken-rs, profiled + optimized | 30.4 | 33 | dp4a kernels, rope tables, parallel router, fused MLP chain |
-| freeToken-rs, + GPU attention & q4 lm_head | **42.2** | **24** | f16 KV cache on GPU, flash-decode kernel, overlapped MLP/MoE |
+| freeToken-rs, + GPU attention & q4 lm_head | 42.2 | 24 | f16 KV cache on GPU, flash-decode kernel, overlapped MLP/MoE |
+| freeToken-rs, GPU-resident decode | **46.8** | **21** | norms/rope/router/combine on device, pooled KV, 1 sync/layer |
 | Python FreeToken, Triton fallback (driver 550) | 68.0 | 14.7 | CUDA graphs, Triton attention |
 | Python FreeToken, native accel (driver 580) | 91.8 | 10.9 | flashinfer + sglang-kernel |
 
