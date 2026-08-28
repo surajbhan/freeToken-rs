@@ -174,6 +174,8 @@ fn main() -> Result<()> {
     let mut g_act = compute.alloc_zeros::<f32>(topk * inter)?;
     let mut g_y_down = compute.alloc_zeros::<f32>(topk * hidden)?;
     let mut g_slots = compute.alloc_zeros::<i32>(topk)?;
+    let mut g_x_q8 = compute.alloc_zeros::<u8>(hidden / 32 * ft_cuda::Q8_BLK)?;
+    let mut g_act_q8 = compute.alloc_zeros::<u8>(topk * inter / 32 * ft_cuda::Q8_BLK)?;
     let mut out_h = compute.alloc_zeros::<f32>(hidden)?;
     let mut cpu_part_dev = compute.alloc_zeros::<f32>(hidden)?;
     let mut y_cpu_gu = vec![0f32; gu_rows];
@@ -264,9 +266,11 @@ fn main() -> Result<()> {
                 // regardless of expert count.
                 let slots_i32: Vec<i32> = gpu_experts.iter().map(|&s| s as i32).collect();
                 compute.memcpy_htod(&slots_i32, &mut g_slots.slice_mut(0..n))?;
-                gemv.gemv_grouped(&compute, &cache_buf, eb, 0, &g_slots, n, &x_hidden, 0, &mut g_y_gu, gu_rows, gu_rows, hidden)?;
+                gemv.quantize_q8(&compute, &x_hidden, 0, &mut g_x_q8, hidden, 1)?;
+                gemv.gemv_grouped_q8(&compute, &cache_buf, eb, 0, &g_slots, n, &g_x_q8, 0, &mut g_y_gu, gu_rows, gu_rows, hidden)?;
                 gemv.silu_mul_grouped(&compute, &g_y_gu, &mut g_act, inter, n)?;
-                gemv.gemv_grouped(&compute, &cache_buf, eb, gu_bytes, &g_slots, n, &g_act, inter, &mut g_y_down, hidden, hidden, inter)?;
+                gemv.quantize_q8(&compute, &g_act, inter, &mut g_act_q8, inter, n)?;
+                gemv.gemv_grouped_q8(&compute, &cache_buf, eb, gu_bytes, &g_slots, n, &g_act_q8, inter / 32, &mut g_y_down, hidden, hidden, inter)?;
                 gemv.reduce_weighted(&compute, &g_y_down, &mut out_h, ew, hidden, n)?;
             } else {
                 for (i, &slot) in gpu_experts.iter().enumerate() {

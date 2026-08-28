@@ -58,7 +58,13 @@ pub struct Q4Gemv {
     q6k: CudaFunction,
     gelu_grouped: CudaFunction,
     reduce_ew: CudaFunction,
+    quant_q8: CudaFunction,
+    grouped_v3: CudaFunction,
+    q6k_q8: CudaFunction,
 }
+
+/// bytes per 32-element q8 activation block (f32 d, f32 s, 32x i8)
+pub const Q8_BLK: usize = 40;
 
 impl Q4Gemv {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
@@ -73,7 +79,10 @@ impl Q4Gemv {
         let q6k = module.load_function("gemv_q6_k")?;
         let gelu_grouped = module.load_function("gelu_mul_grouped")?;
         let reduce_ew = module.load_function("reduce_expert_weighted")?;
-        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew })
+        let quant_q8 = module.load_function("quantize_q8_grouped")?;
+        let grouped_v3 = module.load_function("gemv_q4_0_grouped_v3")?;
+        let q6k_q8 = module.load_function("gemv_q6_k_q8")?;
+        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8 })
     }
 
     /// One launch computing y[e] = W_e x_e for every routed expert of a layer.
@@ -108,6 +117,94 @@ impl Q4Gemv {
         };
         let mut lb = stream.launch_builder(&self.grouped);
         lb.arg(cache).arg(&eb).arg(&off).arg(slots).arg(x).arg(&xs).arg(y).arg(&ys).arg(&nr).arg(&ki);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// Quantize activations to q8 blocks on-GPU: x [n_experts, x_stride] ->
+    /// q8 [n_experts, (k/32)*40 bytes]. x_stride = 0 shares one vector.
+    pub fn quantize_q8(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        x_stride: usize,
+        q8: &mut CudaSlice<u8>,
+        k: usize,
+        n_experts: usize,
+    ) -> Result<()> {
+        assert_eq!(k % 32, 0);
+        let nblocks = k / 32;
+        assert!(q8.len() >= n_experts * nblocks * Q8_BLK);
+        let total_warps = n_experts * nblocks;
+        let (xs, nb, ne) = (x_stride as i32, nblocks as i32, n_experts as i32);
+        let cfg = LaunchConfig {
+            grid_dim: ((total_warps * 32).div_ceil(256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.quant_q8);
+        lb.arg(x).arg(&xs).arg(q8).arg(&nb).arg(&ne);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// v3 grouped GEMV over q8-quantized activations (dp4a integer path).
+    /// q8_stride_blocks = 0 shares one activation across experts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_grouped_q8(
+        &self,
+        stream: &Arc<CudaStream>,
+        cache: &CudaSlice<u8>,
+        expert_bytes: usize,
+        bank_off: usize,
+        slots: &CudaSlice<i32>,
+        n_experts: usize,
+        q8: &CudaSlice<u8>,
+        q8_stride_blocks: usize,
+        y: &mut CudaSlice<f32>,
+        y_stride: usize,
+        n_rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        assert_eq!(k % 32, 0);
+        let nblocks = k / 32;
+        assert!(slots.len() >= n_experts);
+        assert!(y.len() >= n_experts * y_stride);
+        let (eb, off) = (expert_bytes as u64, bank_off as u64);
+        let (qs, ys) = (q8_stride_blocks as i32, y_stride as i32);
+        let (nr, ki) = (n_rows as i32, k as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows.div_ceil(4) as u32, n_experts as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: (nblocks * Q8_BLK) as u32,
+        };
+        let mut lb = stream.launch_builder(&self.grouped_v3);
+        lb.arg(cache).arg(&eb).arg(&off).arg(slots).arg(q8).arg(&qs).arg(y).arg(&ys).arg(&nr).arg(&ki);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// q6_k GEMV over q8-quantized activations (dp4a lm_head fast path).
+    pub fn gemv_q6k_q8(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: &CudaSlice<u8>,
+        q8: &CudaSlice<u8>,
+        y: &mut CudaSlice<f32>,
+        n_rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        assert_eq!(k % 256, 0);
+        assert_eq!(w.len(), n_rows * (k / 256) * 210);
+        assert!(q8.len() >= k / 32 * Q8_BLK);
+        let (nr, ki) = (n_rows as i32, k as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows.div_ceil(16) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: (k / 32 * Q8_BLK) as u32,
+        };
+        let mut lb = stream.launch_builder(&self.q6k_q8);
+        lb.arg(w).arg(q8).arg(y).arg(&nr).arg(&ki);
         unsafe { lb.launch(cfg)? };
         Ok(())
     }

@@ -20,6 +20,7 @@ use ft_gguf::Gguf;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub const HIDDEN: usize = 2816;
 
@@ -166,18 +167,22 @@ pub struct MoeEngine {
     slots_dev: CudaSlice<i32>,
     wts_dev: CudaSlice<f32>,
     x_dev: CudaSlice<f32>,
+    x_q8: CudaSlice<u8>,
+    act_q8: CudaSlice<u8>,
     y_gu: CudaSlice<f32>,
     act: CudaSlice<f32>,
     y_down: CudaSlice<f32>,
     out_dev: CudaSlice<f32>,
 }
 
-/// GPU q4_0 GEMV of a standalone dense tensor: out = W x (one "expert").
+/// GPU q4_0 GEMV of a standalone dense tensor: out = W x (one "expert"),
+/// via the dp4a v3 path (activations quantized to q8 on-GPU).
 #[allow(clippy::too_many_arguments)]
 fn dense_gemv(
     stream: &Arc<CudaStream>,
     gemv: &Q4Gemv,
     xbufs: &mut HashMap<usize, CudaSlice<f32>>,
+    q8bufs: &mut HashMap<usize, CudaSlice<u8>>,
     ybufs: &mut HashMap<usize, CudaSlice<f32>>,
     zero_slot: &CudaSlice<i32>,
     w: &CudaSlice<u8>,
@@ -191,21 +196,74 @@ fn dense_gemv(
     if !xbufs.contains_key(&k) {
         xbufs.insert(k, stream.alloc_zeros::<f32>(k)?);
     }
+    if !q8bufs.contains_key(&k) {
+        q8bufs.insert(k, stream.alloc_zeros::<u8>(k / 32 * ft_cuda::Q8_BLK)?);
+    }
     if !ybufs.contains_key(&n_rows) {
         ybufs.insert(n_rows, stream.alloc_zeros::<f32>(n_rows)?);
     }
     let xd = xbufs.get_mut(&k).unwrap();
     stream.memcpy_htod(x_host, xd)?;
     let xd = xbufs.get(&k).unwrap();
+    let q8 = q8bufs.get_mut(&k).unwrap();
+    gemv.quantize_q8(stream, xd, 0, q8, k, 1)?;
+    let q8 = q8bufs.get(&k).unwrap();
     let yd = ybufs.get_mut(&n_rows).unwrap();
-    gemv.gemv_grouped(stream, w, 0, 0, zero_slot, 1, xd, 0, yd, n_rows, n_rows, k)?;
+    gemv.gemv_grouped_q8(stream, w, 0, 0, zero_slot, 1, q8, 0, yd, n_rows, n_rows, k)?;
     let yd = ybufs.get(&n_rows).unwrap();
     stream.memcpy_dtoh(yd, out)?;
     stream.synchronize()?;
     Ok(())
 }
 
+#[derive(Default, Clone)]
+pub struct Profile {
+    pub embed_us: u64,
+    pub attn_norms_us: u64,   // CPU norms + rope + qk-norms
+    pub qkv_gemv_us: u64,     // upload + gemv + download + sync
+    pub attn_cpu_us: u64,     // scores/softmax/weighted-V on CPU
+    pub o_gemv_us: u64,
+    pub shared_mlp_us: u64,   // gate_up + gelu + down (incl. transfers)
+    pub router_us: u64,
+    pub moe_us: u64,
+    pub combine_us: u64,
+    pub lm_head_us: u64,
+    pub tokens: u64,
+}
+
+impl Profile {
+    pub fn report(&self) -> String {
+        let t = self.tokens.max(1);
+        let per = |v: u64| v as f64 / t as f64 / 1000.0;
+        let total = self.embed_us
+            + self.attn_norms_us
+            + self.qkv_gemv_us
+            + self.attn_cpu_us
+            + self.o_gemv_us
+            + self.shared_mlp_us
+            + self.router_us
+            + self.moe_us
+            + self.combine_us
+            + self.lm_head_us;
+        format!(
+            "per-token ms: embed {:.2} | attn-norms/rope {:.2} | qkv-gemv {:.2} | attn-cpu {:.2} | o-gemv {:.2} | shared-mlp {:.2} | router {:.2} | moe {:.2} | combine {:.2} | lm_head {:.2} | SUM {:.2}",
+            per(self.embed_us),
+            per(self.attn_norms_us),
+            per(self.qkv_gemv_us),
+            per(self.attn_cpu_us),
+            per(self.o_gemv_us),
+            per(self.shared_mlp_us),
+            per(self.router_us),
+            per(self.moe_us),
+            per(self.combine_us),
+            per(self.lm_head_us),
+            per(total)
+        )
+    }
+}
+
 pub struct Model {
+    pub prof: Profile,
     pub cfg: Config,
     pub layers: Vec<LayerWeights>,
     pub final_norm: Vec<f32>,
@@ -217,11 +275,14 @@ pub struct Model {
     pub copy_stream: Arc<CudaStream>,
     zero_slot: CudaSlice<i32>,
     xbufs: HashMap<usize, CudaSlice<f32>>,
+    q8bufs: HashMap<usize, CudaSlice<u8>>,
     ybufs: HashMap<usize, CudaSlice<f32>>,
     act_dev: CudaSlice<f32>,
     logits_dev: CudaSlice<f32>,
     k_cache: Vec<Vec<f32>>,
     v_cache: Vec<Vec<f32>>,
+    inv_freq_swa: Vec<f32>,
+    inv_freq_full: Vec<f32>,
     pub seq_len: usize,
 }
 
@@ -259,18 +320,24 @@ fn rmsnorm_inplace(x: &mut [f32], w: Option<&[f32]>, eps: f32) {
     }
 }
 
-/// NeoX half-rotation rope over each head in `v`.
-fn rope_neox(v: &mut [f32], head_dim: usize, pos: usize, base: f32) {
+/// NeoX half-rotation rope over each head in `v`, using a precomputed
+/// inverse-frequency table (powf per element was ~2 ms/token).
+fn rope_neox(v: &mut [f32], head_dim: usize, pos: usize, inv_freq: &[f32]) {
     let half = head_dim / 2;
     for h in v.chunks_exact_mut(head_dim) {
         for i in 0..half {
-            let theta = pos as f32 / base.powf(2.0 * i as f32 / head_dim as f32);
-            let (s, c) = theta.sin_cos();
+            let (s, c) = (pos as f32 * inv_freq[i]).sin_cos();
             let (a, b) = (h[i], h[i + half]);
             h[i] = a * c - b * s;
             h[i + half] = a * s + b * c;
         }
     }
+}
+
+fn build_inv_freq(head_dim: usize, base: f32) -> Vec<f32> {
+    (0..head_dim / 2)
+        .map(|i| 1.0 / base.powf(2.0 * i as f32 / head_dim as f32))
+        .collect()
 }
 
 fn gelu_tanh(g: f32) -> f32 {
@@ -379,6 +446,9 @@ impl Model {
             slots_dev: stream.alloc_zeros::<i32>(cfg.topk)?,
             wts_dev: stream.alloc_zeros::<f32>(cfg.topk)?,
             x_dev: stream.alloc_zeros::<f32>(HIDDEN)?,
+            x_q8: stream.alloc_zeros::<u8>(HIDDEN / 32 * ft_cuda::Q8_BLK)?,
+            act_q8: stream
+                .alloc_zeros::<u8>(cfg.topk * cfg.moe_inter / 32 * ft_cuda::Q8_BLK)?,
             y_gu: stream.alloc_zeros::<f32>(cfg.topk * gu_rows)?,
             act: stream.alloc_zeros::<f32>(cfg.topk * cfg.moe_inter)?,
             y_down: stream.alloc_zeros::<f32>(cfg.topk * HIDDEN)?,
@@ -389,13 +459,17 @@ impl Model {
             .map(|l| cfg.kv_heads[l] * cfg.head_dim(l))
             .collect();
         Ok(Self {
+            prof: Profile::default(),
             zero_slot: stream.alloc_zeros::<i32>(1)?,
             xbufs: HashMap::new(),
+            q8bufs: HashMap::new(),
             ybufs: HashMap::new(),
             act_dev: stream.alloc_zeros::<f32>(cfg.ffn)?,
             logits_dev: stream.alloc_zeros::<f32>(cfg.vocab)?,
             k_cache: kv_dims.iter().map(|d| vec![0f32; cfg.max_seq * d]).collect(),
             v_cache: kv_dims.iter().map(|d| vec![0f32; cfg.max_seq * d]).collect(),
+            inv_freq_swa: build_inv_freq(cfg.head_dim_swa, cfg.rope_base_swa),
+            inv_freq_full: build_inv_freq(cfg.head_dim_full, cfg.rope_base_full),
             seq_len: 0,
             cfg,
             layers,
@@ -416,6 +490,14 @@ impl Model {
         let pos = self.seq_len;
         anyhow::ensure!(pos < cfg.max_seq, "context overflow");
 
+        let mut t = Instant::now();
+        macro_rules! lap {
+            ($field:ident) => {{
+                let now = Instant::now();
+                self.prof.$field += now.duration_since(t).as_micros() as u64;
+                t = now;
+            }};
+        }
         // embedding row * sqrt(hidden)
         let erb = q6k::row_bytes(HIDDEN);
         let mut x = vec![0f32; HIDDEN];
@@ -428,6 +510,7 @@ impl Model {
             *v *= scale;
         }
 
+        lap!(embed_us);
         let mut h = vec![0f32; HIDDEN];
         for l in 0..cfg.n_layers {
             let hd = cfg.head_dim(l);
@@ -441,12 +524,15 @@ impl Model {
             };
 
             // --- attention sandwich ---
+            t = Instant::now();
             rmsnorm_into(&x, Some(&self.layers[l].attn_norm), cfg.eps, &mut h);
+            lap!(attn_norms_us);
             let mut qkv = vec![0f32; self.layers[l].qkv_rows];
             dense_gemv(
                 &self.stream,
                 &self.gemv,
                 &mut self.xbufs,
+                &mut self.q8bufs,
                 &mut self.ybufs,
                 &self.zero_slot,
                 &self.layers[l].qkv,
@@ -455,6 +541,7 @@ impl Model {
                 HIDDEN,
                 &mut qkv,
             )?;
+            lap!(qkv_gemv_us);
 
             let (q, rest) = qkv.split_at_mut(q_rows);
             let (k, v) = rest.split_at_mut(kv_dim);
@@ -467,11 +554,13 @@ impl Model {
             for vh in v.chunks_exact_mut(hd) {
                 rmsnorm_inplace(vh, None, cfg.eps);
             }
-            rope_neox(q, hd, pos, cfg.rope_base(l));
-            rope_neox(k, hd, pos, cfg.rope_base(l));
+            let inv_freq = if cfg.swa[l] { &self.inv_freq_swa } else { &self.inv_freq_full };
+            rope_neox(q, hd, pos, inv_freq);
+            rope_neox(k, hd, pos, inv_freq);
 
             self.k_cache[l][pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(k);
             self.v_cache[l][pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(v);
+            lap!(attn_norms_us);
 
             // GQA attention on CPU (sm_scale = 1.0 per reference config)
             let group = cfg.n_heads / kvh;
@@ -503,12 +592,14 @@ impl Model {
                         }
                     }
                 });
+            lap!(attn_cpu_us);
 
             let mut attn = vec![0f32; HIDDEN];
             dense_gemv(
                 &self.stream,
                 &self.gemv,
                 &mut self.xbufs,
+                &mut self.q8bufs,
                 &mut self.ybufs,
                 &self.zero_slot,
                 &self.layers[l].o,
@@ -517,6 +608,7 @@ impl Model {
                 q_rows,
                 &mut attn,
             )?;
+            lap!(o_gemv_us);
             rmsnorm_inplace(&mut attn, Some(&self.layers[l].post_attn_norm), cfg.eps);
 
             // x = residual + attn; pre_ff = norm(x)
@@ -526,38 +618,60 @@ impl Model {
             let mut pre_ff = vec![0f32; HIDDEN];
             rmsnorm_into(&x, Some(&self.layers[l].ffn_norm), cfg.eps, &mut pre_ff);
 
-            // --- shared MLP: gate_up -> gelu*up -> down (GPU) ---
+            // --- shared MLP: gate_up -> gelu*up -> down, all on GPU, 1 sync ---
             let gu_rows = 2 * cfg.ffn;
-            let mut gu = vec![0f32; gu_rows];
-            dense_gemv(
-                &self.stream,
-                &self.gemv,
-                &mut self.xbufs,
-                &mut self.ybufs,
-                &self.zero_slot,
-                &self.layers[l].gate_up,
-                &pre_ff,
-                gu_rows,
-                HIDDEN,
-                &mut gu,
-            )?;
-            let mut act = vec![0f32; cfg.ffn];
-            for i in 0..cfg.ffn {
-                act[i] = gelu_tanh(gu[i]) * gu[i + cfg.ffn];
+            for (map_k, len) in [(HIDDEN, HIDDEN), (cfg.ffn, cfg.ffn)] {
+                if !self.q8bufs.contains_key(&map_k) {
+                    self.q8bufs
+                        .insert(map_k, self.stream.alloc_zeros::<u8>(len / 32 * ft_cuda::Q8_BLK)?);
+                }
+            }
+            if !self.xbufs.contains_key(&HIDDEN) {
+                self.xbufs.insert(HIDDEN, self.stream.alloc_zeros::<f32>(HIDDEN)?);
+            }
+            for rows in [gu_rows, HIDDEN] {
+                if !self.ybufs.contains_key(&rows) {
+                    self.ybufs.insert(rows, self.stream.alloc_zeros::<f32>(rows)?);
+                }
+            }
+            {
+                let xd = self.xbufs.get_mut(&HIDDEN).unwrap();
+                self.stream.memcpy_htod(&pre_ff, xd)?;
+            }
+            {
+                let xd = self.xbufs.get(&HIDDEN).unwrap();
+                let q8 = self.q8bufs.get_mut(&HIDDEN).unwrap();
+                self.gemv.quantize_q8(&self.stream, xd, 0, q8, HIDDEN, 1)?;
+            }
+            {
+                let q8 = self.q8bufs.get(&HIDDEN).unwrap();
+                let yd = self.ybufs.get_mut(&gu_rows).unwrap();
+                self.gemv.gemv_grouped_q8(
+                    &self.stream, &self.layers[l].gate_up, 0, 0, &self.zero_slot, 1,
+                    q8, 0, yd, gu_rows, gu_rows, HIDDEN,
+                )?;
+            }
+            {
+                let yd = self.ybufs.get(&gu_rows).unwrap();
+                self.gemv
+                    .gelu_mul_grouped(&self.stream, yd, &mut self.act_dev, cfg.ffn, 1)?;
+                let q8a = self.q8bufs.get_mut(&cfg.ffn).unwrap();
+                self.gemv
+                    .quantize_q8(&self.stream, &self.act_dev, 0, q8a, cfg.ffn, 1)?;
             }
             let mut shared = vec![0f32; HIDDEN];
-            dense_gemv(
-                &self.stream,
-                &self.gemv,
-                &mut self.xbufs,
-                &mut self.ybufs,
-                &self.zero_slot,
-                &self.layers[l].down,
-                &act,
-                HIDDEN,
-                cfg.ffn,
-                &mut shared,
-            )?;
+            {
+                let q8a = self.q8bufs.get(&cfg.ffn).unwrap();
+                let yd = self.ybufs.get_mut(&HIDDEN).unwrap();
+                self.gemv.gemv_grouped_q8(
+                    &self.stream, &self.layers[l].down, 0, 0, &self.zero_slot, 1,
+                    q8a, 0, yd, HIDDEN, HIDDEN, cfg.ffn,
+                )?;
+                let yd = self.ybufs.get(&HIDDEN).unwrap();
+                self.stream.memcpy_dtoh(yd, &mut shared)?;
+                self.stream.synchronize()?;
+            }
+            lap!(shared_mlp_us);
 
             // --- router (CPU) ---
             let mut rh = vec![0f32; HIDDEN];
@@ -568,15 +682,16 @@ impl Model {
             }
             let rw = &self.layers[l].router_w;
             let mut logits: Vec<(f32, usize)> = (0..cfg.n_experts)
+                .into_par_iter()
                 .map(|e| {
-                    (
-                        rw[e * HIDDEN..(e + 1) * HIDDEN]
-                            .iter()
-                            .zip(&rh)
-                            .map(|(a, b)| a * b)
-                            .sum::<f32>(),
-                        e,
-                    )
+                    let row = &rw[e * HIDDEN..(e + 1) * HIDDEN];
+                    let mut acc = [0f32; 8];
+                    for (cr, cx) in row.chunks_exact(8).zip(rh.chunks_exact(8)) {
+                        for j in 0..8 {
+                            acc[j] += cr[j] * cx[j];
+                        }
+                    }
+                    (acc.iter().sum::<f32>(), e)
                 })
                 .collect();
             logits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
@@ -591,10 +706,12 @@ impl Model {
                 .map(|(&(_, e), &xv)| xv / denom * self.layers[l].per_expert_scale[e])
                 .collect();
 
+            lap!(router_us);
             // --- routed experts through the offload engine ---
             let mut routed_in = vec![0f32; HIDDEN];
             rmsnorm_into(&x, Some(&self.layers[l].pre_ffw2), cfg.eps, &mut routed_in);
             let routed = self.moe_forward(l, &routed_ids, &routed_wts, &routed_in)?;
+            lap!(moe_us);
 
             // --- dual-rmsnorm combine ---
             let mut n1 = vec![0f32; HIDDEN];
@@ -610,6 +727,7 @@ impl Model {
             for i in 0..HIDDEN {
                 x[i] = (x[i] + n1[i]) * ls;
             }
+            lap!(combine_us);
         }
 
         // final norm + tied q6_k lm_head + softcap
@@ -621,9 +739,14 @@ impl Model {
         }
         let xd = self.xbufs.get_mut(&HIDDEN).unwrap();
         self.stream.memcpy_htod(&x, xd)?;
-        let xd = self.xbufs.get(&HIDDEN).unwrap();
+        {
+            let xd = self.xbufs.get(&HIDDEN).unwrap();
+            let q8 = self.q8bufs.get_mut(&HIDDEN).unwrap();
+            self.gemv.quantize_q8(&self.stream, xd, 0, q8, HIDDEN, 1)?;
+        }
+        let q8 = self.q8bufs.get(&HIDDEN).unwrap();
         self.gemv
-            .gemv_q6k(&self.stream, &self.embed_gpu, xd, &mut self.logits_dev, cfg.vocab, HIDDEN)?;
+            .gemv_q6k_q8(&self.stream, &self.embed_gpu, q8, &mut self.logits_dev, cfg.vocab, HIDDEN)?;
         let mut logits = vec![0f32; cfg.vocab];
         self.stream.memcpy_dtoh(&self.logits_dev, &mut logits)?;
         self.stream.synchronize()?;
@@ -631,6 +754,8 @@ impl Model {
         for v in logits.iter_mut() {
             *v = (*v / cap).tanh() * cap;
         }
+        lap!(lm_head_us);
+        self.prof.tokens += 1;
         self.seq_len += 1;
         Ok(logits)
     }
@@ -683,14 +808,16 @@ impl Model {
                 self.stream.memcpy_htod(&gwts, &mut wd)?;
             }
             let gu_rows = 2 * inter;
-            self.gemv.gemv_grouped(
+            self.gemv
+                .quantize_q8(&self.stream, &self.moe.x_dev, 0, &mut self.moe.x_q8, HIDDEN, 1)?;
+            self.gemv.gemv_grouped_q8(
                 &self.stream,
                 &self.moe.cache_buf,
                 self.moe.eb,
                 0,
                 &self.moe.slots_dev,
                 n,
-                &self.moe.x_dev,
+                &self.moe.x_q8,
                 0,
                 &mut self.moe.y_gu,
                 gu_rows,
@@ -699,15 +826,17 @@ impl Model {
             )?;
             self.gemv
                 .gelu_mul_grouped(&self.stream, &self.moe.y_gu, &mut self.moe.act, inter, n)?;
-            self.gemv.gemv_grouped(
+            self.gemv
+                .quantize_q8(&self.stream, &self.moe.act, inter, &mut self.moe.act_q8, inter, n)?;
+            self.gemv.gemv_grouped_q8(
                 &self.stream,
                 &self.moe.cache_buf,
                 self.moe.eb,
                 self.moe.gu_bytes,
                 &self.moe.slots_dev,
                 n,
-                &self.moe.act,
-                inter,
+                &self.moe.act_q8,
+                inter / 32,
                 &mut self.moe.y_down,
                 HIDDEN,
                 HIDDEN,

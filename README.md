@@ -19,18 +19,33 @@ finish together.
 | `ft-cuda` | CUDA kernels (build-time PTX, `compute_75`+): grouped q4_0 dequant-GEMV with shared-memory activations, silu/reduce, `HostBanks` (`cuMemHostRegister` pinned memory) |
 | `ft-bench` | `ft-bench` (bandwidth calibration, port of `ft bench bw`) and `decode` (hybrid MoE decode benchmark, synthetic or real GGUF experts) |
 
-## Results (RTX 4060 Ti, Gemma-4-26B-A4B QAT q4_0, 1862-slot cache)
+## Results (RTX 4060 Ti 16 GB, Gemma-4-26B-A4B QAT q4_0)
 
-MoE expert-FFN cost per decode token at ~95% cache-hit routing:
+**MoE expert-FFN kernel progression** (microbenchmark, ~95% cache-hit routing,
+1862 GPU slots):
 
-| configuration | ms/token | tok/s ceiling |
+| kernel | ms/token | tok/s ceiling |
 |---|---|---|
-| naive per-expert kernels | 20.9 | 48 |
+| naive per-expert launches | 20.9 | 48 |
 | grouped launches (4/layer) | 19.6 | 51 |
-| **kernel v2 (smem activations, u16 loads)** | **7.9** | **126** |
+| v2: smem activations, u16 loads, warp/row | 7.9 | 126 |
+| **v3: dp4a integer dot over GPU-quantized q8 activations** | **~3** | **~300** |
 
-Reference: the original Python engine serves the complete model at 14.7 ms/token
-(68 tok/s) on the same hardware via its Triton fallback path.
+**Full-model decode** (end-to-end generation, real routing, single stream):
+
+| engine | tok/s | ms/token | notes |
+|---|---|---|---|
+| freeToken-rs, first working build | 16.0 | 63 | CPU attention, f32 kernels |
+| freeToken-rs, profiled + optimized | **30.4** | **33** | dp4a kernels, rope tables, parallel router, fused MLP chain |
+| Python FreeToken, Triton fallback (driver 550) | 68.0 | 14.7 | CUDA graphs, Triton attention |
+| Python FreeToken, native accel (driver 580) | 91.8 | 10.9 | flashinfer + sglang-kernel |
+
+Per-token profile after optimization (30 layers): moe 10.0 · lm_head 9.2 ·
+attn-cpu 3.7 · router 3.4 · qkv+o gemv 4.8 · shared-mlp 2.4 · rope/norms 1.2 ms.
+Known headroom, in order: GPU attention (removes ~7 ms of CPU work + 2
+syncs/layer), a wider lm_head kernel, CUDA-graphing the decode step, and
+continuous batching. The Python engine's remaining lead is exactly its CUDA
+graphs + fused attention path, not the language.
 
 ```
 cargo test --release          # unit + GPU parity tests

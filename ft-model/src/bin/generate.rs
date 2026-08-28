@@ -109,5 +109,6 @@ fn main() -> Result<()> {
         out_ids.len() as f64 / dt,
         model.moe.cache.hit_rate() * 100.0
     );
+    eprintln!("{}", model.prof.report());
     Ok(())
 }
