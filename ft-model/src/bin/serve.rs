@@ -66,71 +66,137 @@ struct AppState {
     model_name: String,
 }
 
+fn sample(logits: &[f32], temperature: f32, rng: &mut u64) -> u32 {
+    if temperature <= 0.0 {
+        return logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0 as u32;
+    }
+    let mx = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let probs: Vec<f32> = logits.iter().map(|&l| ((l - mx) / temperature).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    let mut r = (*rng >> 11) as f32 / (1u64 << 53) as f32 * sum;
+    for (i, &p) in probs.iter().enumerate() {
+        r -= p;
+        if r <= 0.0 {
+            return i as u32;
+        }
+    }
+    (probs.len() - 1) as u32
+}
+
+struct ActiveSeq {
+    slot: usize,
+    tx: mpsc::Sender<Option<String>>,
+    temperature: f32,
+    rng: u64,
+    remaining: usize,
+    last_logits: Vec<f32>,
+}
+
+/// Continuous-batching worker: new requests are prefilled on admission (one
+/// sequence at a time), then all active sequences decode together — one
+/// forward_batch per step. Finished sequences free their slot immediately.
 fn worker(mut model: Model, tok: Tokenizer, rx: mpsc::Receiver<GenJob>) {
-    while let Ok(job) = rx.recv() {
-        // fresh context per request
-        model.seq_len = 0;
-        let mut logits = Vec::new();
-        let mut failed = false;
-        for &id in &job.prompt_ids {
-            match model.forward_token(id) {
-                Ok(l) => logits = l,
-                Err(e) => {
-                    eprintln!("prefill error: {e:#}");
-                    failed = true;
-                    break;
+    let max_batch = model.max_batch;
+    let mut active: Vec<ActiveSeq> = Vec::new();
+    let mut free_slots: Vec<usize> = (0..max_batch).rev().collect();
+    loop {
+        // admit while slots are free (block only when fully idle)
+        loop {
+            let job = if active.is_empty() {
+                match rx.recv() {
+                    Ok(j) => j,
+                    Err(_) => return,
                 }
-            }
-        }
-        if failed || logits.is_empty() {
-            let _ = job.tx.send(None);
-            continue;
-        }
-        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
-        for _ in 0..job.max_new {
-            let next = if job.temperature <= 0.0 {
-                logits
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                    .unwrap()
-                    .0 as u32
+            } else if free_slots.is_empty() {
+                break;
             } else {
-                let mx = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                let probs: Vec<f32> = logits
-                    .iter()
-                    .map(|&l| ((l - mx) / job.temperature).exp())
-                    .collect();
-                let sum: f32 = probs.iter().sum();
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                let mut r = (rng >> 11) as f32 / (1u64 << 53) as f32 * sum;
-                let mut pick = 0;
-                for (i, &p) in probs.iter().enumerate() {
-                    r -= p;
-                    if r <= 0.0 {
-                        pick = i;
+                match rx.try_recv() {
+                    Ok(j) => j,
+                    Err(_) => break,
+                }
+            };
+            let slot = free_slots.pop().unwrap();
+            model.reset_slot(slot);
+            let budget = model.cfg.max_seq.saturating_sub(job.max_new + 2);
+            let prompt = &job.prompt_ids[..job.prompt_ids.len().min(budget)];
+            let mut logits = Vec::new();
+            let mut ok = true;
+            for &id in prompt {
+                match model.forward_batch(&[(slot, id)]) {
+                    Ok(mut o) => logits = o.pop().unwrap(),
+                    Err(e) => {
+                        eprintln!("prefill error: {e:#}");
+                        ok = false;
                         break;
                     }
                 }
-                pick as u32
-            };
-            if next == tok.eos || Some(next) == tok.eot {
-                break;
             }
-            if job.tx.send(Some(tok.decode(&[next]))).is_err() {
-                break; // client went away
+            if !ok || logits.is_empty() {
+                let _ = job.tx.send(None);
+                free_slots.push(slot);
+                continue;
             }
-            match model.forward_token(next) {
-                Ok(l) => logits = l,
-                Err(e) => {
-                    eprintln!("decode error: {e:#}");
-                    break;
+            active.push(ActiveSeq {
+                slot,
+                tx: job.tx,
+                temperature: job.temperature,
+                rng: 0x9E37_79B9_7F4A_7C15,
+                remaining: job.max_new,
+                last_logits: logits,
+            });
+        }
+
+        // one batched decode step
+        let mut reqs: Vec<(usize, u32)> = Vec::new();
+        let mut keep: Vec<bool> = Vec::with_capacity(active.len());
+        for seq in active.iter_mut() {
+            let next = sample(&seq.last_logits, seq.temperature, &mut seq.rng);
+            let stop = next == tok.eos
+                || Some(next) == tok.eot
+                || seq.remaining == 0
+                || seq.tx.send(Some(tok.decode(&[next]))).is_err();
+            if stop {
+                let _ = seq.tx.send(None);
+                keep.push(false);
+            } else {
+                seq.remaining -= 1;
+                reqs.push((seq.slot, next));
+                keep.push(true);
+            }
+        }
+        let mut ki = keep.iter();
+        active.retain(|seq| {
+            let k = *ki.next().unwrap();
+            if !k {
+                free_slots.push(seq.slot);
+            }
+            k
+        });
+        if reqs.is_empty() {
+            continue;
+        }
+        match model.forward_batch(&reqs) {
+            Ok(outs) => {
+                for (seq, lg) in active.iter_mut().zip(outs) {
+                    seq.last_logits = lg;
+                }
+            }
+            Err(e) => {
+                eprintln!("decode error: {e:#}");
+                for seq in active.drain(..) {
+                    let _ = seq.tx.send(None);
+                    free_slots.push(seq.slot);
                 }
             }
         }
-        let _ = job.tx.send(None);
     }
 }
 
@@ -272,7 +338,8 @@ fn main() -> anyhow::Result<()> {
     TOKENIZER.set(tok).ok();
     let tok2 = Tokenizer::from_gguf(&g)?;
     let ctx = CudaContext::new(0)?;
-    let model = Model::load(&g, &ctx, slots, fraction)?;
+    let batch = arg("batch", 4.0) as usize;
+    let model = Model::load(&g, &ctx, slots, fraction, batch)?;
     drop(g);
     eprintln!("model loaded; serving on 0.0.0.0:{port}");
 

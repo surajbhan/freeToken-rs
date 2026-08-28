@@ -318,6 +318,85 @@ extern "C" __global__ void quantize_q8_grouped(
     blk[8 + lane] = (unsigned char)(signed char)q;
 }
 
+// like gemv_q4_0_grouped_v3 but with an explicit activation-row indirection:
+// entry e uses q8 row x_idx[e]. Enables batched MoE (per (seq,expert) pairs)
+// and any layout where the activation isn't 1:1 with the entry index.
+extern "C" __global__ void gemv_q4_0_grouped_v3_idx(
+    const unsigned char* __restrict__ base,
+    unsigned long long expert_bytes,
+    unsigned long long bank_off,
+    const int* __restrict__ slots,
+    const int* __restrict__ x_idx,
+    const unsigned char* __restrict__ q8,
+    int q8_stride_blocks,
+    float* __restrict__ y,
+    int y_stride,
+    int n_rows,
+    int k)
+{
+    extern __shared__ unsigned char q8s[];
+    int e = blockIdx.y;
+    int nblocks = k / 32;
+    {
+        const unsigned char* src = q8 + (size_t)x_idx[e] * q8_stride_blocks * 40;
+        for (int i = threadIdx.x; i < nblocks * 40 / 4; i += blockDim.x)
+            reinterpret_cast<unsigned int*>(q8s)[i] =
+                reinterpret_cast<const unsigned int*>(src)[i];
+    }
+    __syncthreads();
+
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * 4 + warp;
+    if (row >= n_rows) return;
+    const unsigned char* wr = base + (size_t)slots[e] * expert_bytes + bank_off
+                            + (size_t)row * nblocks * 18;
+
+    float acc = 0.0f;
+    for (int b = lane; b < nblocks; b += 32) {
+        const unsigned short* p = reinterpret_cast<const unsigned short*>(wr + b * 18);
+        float d4 = __half2float(__ushort_as_half(p[0]));
+        const unsigned char* qb = q8s + b * 40;
+        float d8 = *reinterpret_cast<const float*>(qb);
+        float s8 = *reinterpret_cast<const float*>(qb + 4);
+        const int* x8 = reinterpret_cast<const int*>(qb + 8);
+        int isum = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            unsigned int g = (unsigned int)p[1 + 2 * i] | ((unsigned int)p[2 + 2 * i] << 16);
+            int lo = g & 0x0F0F0F0Fu;
+            int hi = (g >> 4) & 0x0F0F0F0Fu;
+            isum = __dp4a(lo, x8[i], isum);
+            isum = __dp4a(hi, x8[4 + i], isum);
+        }
+        acc += d4 * (d8 * (float)isum - 8.0f * s8);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    if (lane == 0) y[(size_t)e * y_stride + row] = acc;
+}
+
+// per-sequence weighted combine of (seq,expert)-pair outputs:
+// out[s][i] += sum over pairs p with seq_of[p]==s of wts[p] * y[p][i].
+// Grid: (ceil(hidden/256), n_seqs); each block-row s scans all pairs.
+extern "C" __global__ void reduce_pairs_weighted(
+    const float* __restrict__ y,      // [n_pairs, hidden]
+    const float* __restrict__ wts,    // [n_pairs]
+    const int* __restrict__ seq_of,   // [n_pairs]
+    float* __restrict__ out,          // [n_seqs, hidden]
+    int hidden,
+    int n_pairs)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int s = blockIdx.y;
+    if (i >= hidden) return;
+    float acc = 0.0f;
+    for (int p = 0; p < n_pairs; ++p)
+        if (seq_of[p] == s) acc += wts[p] * y[(size_t)p * hidden + i];
+    out[(size_t)s * hidden + i] += acc;
+}
+
 // grouped GEMV over q8-quantized activations. Same slot-cache addressing as
 // v2; q8 activation staged in shared memory (nblocks*40 bytes).
 extern "C" __global__ void gemv_q4_0_grouped_v3(

@@ -97,7 +97,7 @@ impl Config {
             moe_inter: m("expert_feed_forward_length")? as usize,
             softcap: mf("final_logit_softcapping")?,
             vocab,
-            max_seq: 8192,
+            max_seq: 2048,
         })
     }
 
@@ -283,14 +283,35 @@ pub struct Model {
     ybufs: HashMap<usize, CudaSlice<f32>>,
     act_dev: CudaSlice<f32>,
     logits_dev: CudaSlice<f32>,
-    k_cache: Vec<CudaSlice<u16>>,
-    v_cache: Vec<CudaSlice<u16>>,
+    /// [batch_slot][layer] f16 KV caches
+    k_cache: Vec<Vec<CudaSlice<u16>>>,
+    v_cache: Vec<Vec<CudaSlice<u16>>>,
     kv_host: Vec<u16>,
     q_dev: CudaSlice<f32>,
     attn_out_dev: CudaSlice<f32>,
     inv_freq_swa: Vec<f32>,
     inv_freq_full: Vec<f32>,
-    pub seq_len: usize,
+    pub max_batch: usize,
+    /// per batch-slot sequence position
+    pub seq_pos: Vec<usize>,
+    // batched MoE pair staging
+    pair_slots: CudaSlice<i32>,
+    pair_xidx: CudaSlice<i32>,
+    pair_wts: CudaSlice<f32>,
+    pair_seq: CudaSlice<i32>,
+    pair_slots_h: Vec<i32>,
+    pair_xidx_h: Vec<i32>,
+    pair_wts_h: Vec<f32>,
+    pair_seq_h: Vec<i32>,
+    pair_y_gu: CudaSlice<f32>,
+    pair_act: CudaSlice<f32>,
+    pair_act_q8: CudaSlice<u8>,
+    pair_y_down: CudaSlice<f32>,
+    routed_out_dev: CudaSlice<f32>,
+    dense_idx: CudaSlice<i32>,
+    zeros_b: CudaSlice<i32>,
+    q8_preff: CudaSlice<u8>,
+    q8_routed: CudaSlice<u8>,
 }
 
 fn rmsnorm_into(x: &[f32], w: Option<&[f32]>, eps: f32, out: &mut [f32]) {
@@ -357,6 +378,7 @@ impl Model {
         ctx: &Arc<CudaContext>,
         cache_slots: usize,
         fraction: f64,
+        max_batch: usize,
     ) -> Result<Self> {
         let cfg = Config::from_gguf(g)?;
         let stream = ctx.default_stream();
@@ -488,22 +510,53 @@ impl Model {
             xbufs: HashMap::new(),
             q8bufs: HashMap::new(),
             ybufs: HashMap::new(),
-            act_dev: stream.alloc_zeros::<f32>(cfg.ffn)?,
-            logits_dev: stream.alloc_zeros::<f32>(cfg.vocab)?,
-            k_cache: kv_dims
-                .iter()
-                .map(|d| stream.alloc_zeros::<u16>(cfg.max_seq * d))
+            act_dev: stream.alloc_zeros::<f32>(max_batch * cfg.ffn)?,
+            logits_dev: stream.alloc_zeros::<f32>(max_batch * cfg.vocab)?,
+            k_cache: (0..max_batch)
+                .map(|_| {
+                    kv_dims
+                        .iter()
+                        .map(|d| stream.alloc_zeros::<u16>(cfg.max_seq * d))
+                        .collect::<Result<Vec<_>, _>>()
+                })
                 .collect::<Result<_, _>>()?,
-            v_cache: kv_dims
-                .iter()
-                .map(|d| stream.alloc_zeros::<u16>(cfg.max_seq * d))
+            v_cache: (0..max_batch)
+                .map(|_| {
+                    kv_dims
+                        .iter()
+                        .map(|d| stream.alloc_zeros::<u16>(cfg.max_seq * d))
+                        .collect::<Result<Vec<_>, _>>()
+                })
                 .collect::<Result<_, _>>()?,
-            kv_host: vec![0u16; 2 * cfg.n_heads * cfg.head_dim_full],
-            q_dev: stream.alloc_zeros::<f32>(cfg.n_heads * cfg.head_dim_full)?,
-            attn_out_dev: stream.alloc_zeros::<f32>(cfg.n_heads * cfg.head_dim_full)?,
+            kv_host: vec![0u16; max_batch * 2 * cfg.n_heads * cfg.head_dim_full],
+            q_dev: stream.alloc_zeros::<f32>(max_batch * cfg.n_heads * cfg.head_dim_full)?,
+            attn_out_dev: stream
+                .alloc_zeros::<f32>(max_batch * cfg.n_heads * cfg.head_dim_full)?,
             inv_freq_swa: build_inv_freq(cfg.head_dim_swa, cfg.rope_base_swa),
             inv_freq_full: build_inv_freq(cfg.head_dim_full, cfg.rope_base_full),
-            seq_len: 0,
+            max_batch,
+            seq_pos: vec![0; max_batch],
+            pair_slots: stream.alloc_zeros::<i32>(max_batch * cfg.topk)?,
+            pair_xidx: stream.alloc_zeros::<i32>(max_batch * cfg.topk)?,
+            pair_wts: stream.alloc_zeros::<f32>(max_batch * cfg.topk)?,
+            pair_seq: stream.alloc_zeros::<i32>(max_batch * cfg.topk)?,
+            pair_slots_h: Vec::new(),
+            pair_xidx_h: Vec::new(),
+            pair_wts_h: Vec::new(),
+            pair_seq_h: Vec::new(),
+            pair_y_gu: stream.alloc_zeros::<f32>(max_batch * cfg.topk * 2 * cfg.moe_inter)?,
+            pair_act: stream.alloc_zeros::<f32>(max_batch * cfg.topk * cfg.moe_inter)?,
+            pair_act_q8: stream
+                .alloc_zeros::<u8>(max_batch * cfg.topk * cfg.moe_inter / 32 * ft_cuda::Q8_BLK)?,
+            pair_y_down: stream.alloc_zeros::<f32>(max_batch * cfg.topk * HIDDEN)?,
+            routed_out_dev: stream.alloc_zeros::<f32>(max_batch * HIDDEN)?,
+            dense_idx: {
+                let idx: Vec<i32> = (0..(max_batch * cfg.topk) as i32).collect();
+                stream.memcpy_stod(&idx)?
+            },
+            zeros_b: stream.alloc_zeros::<i32>(max_batch * cfg.topk)?,
+            q8_preff: stream.alloc_zeros::<u8>(max_batch * HIDDEN / 32 * ft_cuda::Q8_BLK)?,
+            q8_routed: stream.alloc_zeros::<u8>(max_batch * HIDDEN / 32 * ft_cuda::Q8_BLK)?,
             cfg,
             layers,
             final_norm,
@@ -516,13 +569,31 @@ impl Model {
         })
     }
 
-    /// One decode step for the token at position `self.seq_len`. Returns
-    /// softcapped logits.
-    pub fn forward_token(&mut self, token: u32) -> Result<Vec<f32>> {
-        let cfg = self.cfg.clone();
-        let pos = self.seq_len;
-        anyhow::ensure!(pos < cfg.max_seq, "context overflow");
+    /// debug: read back the dense_idx device buffer
+    pub fn debug_dense_idx(&self) -> Result<Vec<i32>> {
+        let v = self.stream.memcpy_dtov(&self.dense_idx)?;
+        Ok(v)
+    }
 
+    /// Reset a batch slot's sequence (fresh request).
+    pub fn reset_slot(&mut self, slot: usize) {
+        self.seq_pos[slot] = 0;
+    }
+
+    /// Single-sequence step on batch slot 0.
+    pub fn forward_token(&mut self, token: u32) -> Result<Vec<f32>> {
+        let mut out = self.forward_batch(&[(0, token)])?;
+        Ok(out.pop().unwrap())
+    }
+
+    /// One decode step for a set of (batch_slot, token) entries — the
+    /// continuous-batching workhorse. All dense ops, the shared MLP, routed
+    /// experts and the lm_head run batched on GPU; norms/rope/router/topk on
+    /// CPU per sequence. Returns softcapped logits per entry.
+    pub fn forward_batch(&mut self, reqs: &[(usize, u32)]) -> Result<Vec<Vec<f32>>> {
+        let cfg = self.cfg.clone();
+        let nb = reqs.len();
+        anyhow::ensure!(nb >= 1 && nb <= self.max_batch, "bad batch size");
         let mut t = Instant::now();
         macro_rules! lap {
             ($field:ident) => {{
@@ -531,425 +602,455 @@ impl Model {
                 t = now;
             }};
         }
-        // embedding row * sqrt(hidden)
-        let erb = q6k::row_bytes(HIDDEN);
-        let mut x = vec![0f32; HIDDEN];
-        q6k::dequantize_row(
-            &self.embed_cpu[token as usize * erb..(token as usize + 1) * erb],
-            &mut x,
-        );
         let scale = (HIDDEN as f32).sqrt();
-        for v in x.iter_mut() {
-            *v *= scale;
+        let erb = q6k::row_bytes(HIDDEN);
+        let mut xs: Vec<Vec<f32>> = Vec::with_capacity(nb);
+        for &(slot, token) in reqs {
+            anyhow::ensure!(slot < self.max_batch, "bad slot");
+            anyhow::ensure!(self.seq_pos[slot] < cfg.max_seq, "context overflow");
+            let mut x = vec![0f32; HIDDEN];
+            q6k::dequantize_row(
+                &self.embed_cpu[token as usize * erb..(token as usize + 1) * erb],
+                &mut x,
+            );
+            for v in x.iter_mut() {
+                *v *= scale;
+            }
+            xs.push(x);
+        }
+        lap!(embed_us);
+
+        // lazy batch-capacity buffers keyed by width
+        macro_rules! xbuf {
+            ($k:expr) => {{
+                if !self.xbufs.contains_key(&$k) {
+                    self.xbufs
+                        .insert($k, self.stream.alloc_zeros::<f32>(self.max_batch * $k)?);
+                }
+            }};
+        }
+        macro_rules! q8buf {
+            ($k:expr) => {{
+                if !self.q8bufs.contains_key(&$k) {
+                    self.q8bufs.insert(
+                        $k,
+                        self.stream
+                            .alloc_zeros::<u8>(self.max_batch * $k / 32 * ft_cuda::Q8_BLK)?,
+                    );
+                }
+            }};
+        }
+        macro_rules! ybuf {
+            ($r:expr) => {{
+                if !self.ybufs.contains_key(&$r) {
+                    self.ybufs
+                        .insert($r, self.stream.alloc_zeros::<f32>(self.max_batch * $r)?);
+                }
+            }};
         }
 
-        lap!(embed_us);
-        let mut h = vec![0f32; HIDDEN];
+        let mut h_all = vec![0f32; nb * HIDDEN];
+        let kv_stage = 2 * cfg.n_heads * cfg.head_dim_full; // per-seq staging stride
+
         for l in 0..cfg.n_layers {
             let hd = cfg.head_dim(l);
             let kvh = cfg.kv_heads[l];
             let q_rows = cfg.n_heads * hd;
             let kv_dim = kvh * hd;
-            let kv_start = if cfg.swa[l] {
-                (pos + 1).saturating_sub(cfg.window)
-            } else {
-                0
-            };
+            let qkv_rows = self.layers[l].qkv_rows;
+            let group = cfg.n_heads / kvh;
+            let inv_freq = if cfg.swa[l] { &self.inv_freq_swa } else { &self.inv_freq_full };
 
-            // --- attention sandwich ---
+            // --- attention input norm (CPU) + batched qkv gemv ---
             t = Instant::now();
-            rmsnorm_into(&x, Some(&self.layers[l].attn_norm), cfg.eps, &mut h);
+            for (i, x) in xs.iter().enumerate() {
+                rmsnorm_into(x, Some(&self.layers[l].attn_norm), cfg.eps, &mut h_all[i * HIDDEN..(i + 1) * HIDDEN]);
+            }
             lap!(attn_norms_us);
-            let mut qkv = vec![0f32; self.layers[l].qkv_rows];
-            dense_gemv(
-                &self.stream,
-                &self.gemv,
-                &mut self.xbufs,
-                &mut self.q8bufs,
-                &mut self.ybufs,
-                &self.zero_slot,
-                &self.layers[l].qkv,
-                &h,
-                self.layers[l].qkv_rows,
-                HIDDEN,
-                &mut qkv,
-            )?;
+            xbuf!(HIDDEN);
+            q8buf!(HIDDEN);
+            ybuf!(qkv_rows);
+            {
+                let xd = self.xbufs.get_mut(&HIDDEN).unwrap();
+                self.stream.memcpy_htod(&h_all[..nb * HIDDEN], &mut xd.slice_mut(0..nb * HIDDEN))?;
+                let xd = self.xbufs.get(&HIDDEN).unwrap();
+                let q8 = self.q8bufs.get_mut(&HIDDEN).unwrap();
+                self.gemv.quantize_q8(&self.stream, xd, HIDDEN, q8, HIDDEN, nb)?;
+                let q8 = self.q8bufs.get(&HIDDEN).unwrap();
+                let yd = self.ybufs.get_mut(&qkv_rows).unwrap();
+                self.gemv.gemv_grouped_q8_idx(
+                    &self.stream, &self.layers[l].qkv, 0, 0, &self.zeros_b, &self.dense_idx,
+                    nb, q8, HIDDEN / 32, yd, qkv_rows, qkv_rows, HIDDEN,
+                )?;
+            }
+            let mut qkv_all = vec![0f32; nb * qkv_rows];
+            {
+                let yd = self.ybufs.get(&qkv_rows).unwrap();
+                self.stream
+                    .memcpy_dtoh(&yd.slice(0..nb * qkv_rows), &mut qkv_all)?;
+                self.stream.synchronize()?;
+            }
             lap!(qkv_gemv_us);
 
-            let (q, rest) = qkv.split_at_mut(q_rows);
-            let (k, v) = rest.split_at_mut(kv_dim);
-            for qh in q.chunks_exact_mut(hd) {
-                rmsnorm_inplace(qh, Some(&self.layers[l].q_norm), cfg.eps);
-            }
-            for kh in k.chunks_exact_mut(hd) {
-                rmsnorm_inplace(kh, Some(&self.layers[l].k_norm), cfg.eps);
-            }
-            for vh in v.chunks_exact_mut(hd) {
-                rmsnorm_inplace(vh, None, cfg.eps);
-            }
-            let inv_freq = if cfg.swa[l] { &self.inv_freq_swa } else { &self.inv_freq_full };
-            rope_neox(q, hd, pos, inv_freq);
-            rope_neox(k, hd, pos, inv_freq);
-
-            // append k/v to the GPU f16 cache and run attention on-device
-            {
-                for (i, &kv) in k.iter().enumerate() {
-                    self.kv_host[i] = half::f16::from_f32(kv).to_bits();
+            // --- per-seq: head norms, rope, kv append, attention launch ---
+            for (i, &(slot, _)) in reqs.iter().enumerate() {
+                let pos = self.seq_pos[slot];
+                let qkv = &mut qkv_all[i * qkv_rows..(i + 1) * qkv_rows];
+                let (q, rest) = qkv.split_at_mut(q_rows);
+                let (k, v) = rest.split_at_mut(kv_dim);
+                for qh in q.chunks_exact_mut(hd) {
+                    rmsnorm_inplace(qh, Some(&self.layers[l].q_norm), cfg.eps);
                 }
-                for (i, &vv) in v.iter().enumerate() {
-                    self.kv_host[kv_dim + i] = half::f16::from_f32(vv).to_bits();
+                for kh in k.chunks_exact_mut(hd) {
+                    rmsnorm_inplace(kh, Some(&self.layers[l].k_norm), cfg.eps);
                 }
-                let mut kd = self.k_cache[l].slice_mut(pos * kv_dim..(pos + 1) * kv_dim);
-                self.stream.memcpy_htod(&self.kv_host[..kv_dim], &mut kd)?;
-                let mut vd = self.v_cache[l].slice_mut(pos * kv_dim..(pos + 1) * kv_dim);
+                for vh in v.chunks_exact_mut(hd) {
+                    rmsnorm_inplace(vh, None, cfg.eps);
+                }
+                rope_neox(q, hd, pos, inv_freq);
+                rope_neox(k, hd, pos, inv_freq);
+                let st = i * kv_stage;
+                for (j, &kv) in k.iter().enumerate() {
+                    self.kv_host[st + j] = half::f16::from_f32(kv).to_bits();
+                }
+                for (j, &vv) in v.iter().enumerate() {
+                    self.kv_host[st + kv_dim + j] = half::f16::from_f32(vv).to_bits();
+                }
+                let mut kd = self.k_cache[slot][l].slice_mut(pos * kv_dim..(pos + 1) * kv_dim);
+                self.stream.memcpy_htod(&self.kv_host[st..st + kv_dim], &mut kd)?;
+                let mut vd = self.v_cache[slot][l].slice_mut(pos * kv_dim..(pos + 1) * kv_dim);
                 self.stream
-                    .memcpy_htod(&self.kv_host[kv_dim..2 * kv_dim], &mut vd)?;
-            }
-            lap!(attn_norms_us);
-
-            let group = cfg.n_heads / kvh;
-            {
-                let mut qd = self.q_dev.slice_mut(0..q_rows);
+                    .memcpy_htod(&self.kv_host[st + kv_dim..st + 2 * kv_dim], &mut vd)?;
+                let mut qd = self.q_dev.slice_mut(i * q_rows..(i + 1) * q_rows);
                 self.stream.memcpy_htod(&q[..], &mut qd)?;
             }
-            {
-                let qd = self.q_dev.slice(0..q_rows);
-                // wrapper takes full slices; pass the layer caches + geometry
-                let mut od = self.attn_out_dev.slice_mut(0..q_rows);
+            for (i, &(slot, _)) in reqs.iter().enumerate() {
+                let pos = self.seq_pos[slot];
+                let kv_start = if cfg.swa[l] {
+                    (pos + 1).saturating_sub(cfg.window)
+                } else {
+                    0
+                };
+                let qd = self.q_dev.slice(i * q_rows..(i + 1) * q_rows);
+                let mut od = self.attn_out_dev.slice_mut(i * q_rows..(i + 1) * q_rows);
                 self.gemv.attn_decode_view(
-                    &self.stream,
-                    &self.k_cache[l],
-                    &self.v_cache[l],
-                    &qd,
-                    &mut od,
-                    kv_start,
-                    pos + 1,
-                    kv_dim,
-                    hd,
-                    group,
-                    cfg.n_heads,
+                    &self.stream, &self.k_cache[slot][l], &self.v_cache[slot][l],
+                    &qd, &mut od, kv_start, pos + 1, kv_dim, hd, group, cfg.n_heads,
                 )?;
             }
             lap!(attn_cpu_us);
 
-            // o_proj directly off the GPU attention output (one download)
-            let mut attn = vec![0f32; HIDDEN];
+            // --- batched o_proj (attn stays device-side until download) ---
+            q8buf!(q_rows);
+            ybuf!(HIDDEN);
+            let mut attn_all = vec![0f32; nb * HIDDEN];
             {
-                if !self.q8bufs.contains_key(&q_rows) {
-                    self.q8bufs.insert(
-                        q_rows,
-                        self.stream.alloc_zeros::<u8>(q_rows / 32 * ft_cuda::Q8_BLK)?,
-                    );
-                }
-                if !self.ybufs.contains_key(&HIDDEN) {
-                    self.ybufs
-                        .insert(HIDDEN, self.stream.alloc_zeros::<f32>(HIDDEN)?);
-                }
                 {
-                    let ao = self.attn_out_dev.slice(0..q_rows);
+                    let ao = self.attn_out_dev.slice(0..nb * q_rows);
                     let q8 = self.q8bufs.get_mut(&q_rows).unwrap();
-                    self.gemv.quantize_q8_view(&self.stream, &ao, q8, q_rows, 1)?;
+                    self.gemv
+                        .quantize_q8_view(&self.stream, &ao, q_rows, q8, q_rows, nb)?;
                 }
                 let q8 = self.q8bufs.get(&q_rows).unwrap();
                 let yd = self.ybufs.get_mut(&HIDDEN).unwrap();
-                self.gemv.gemv_grouped_q8(
-                    &self.stream, &self.layers[l].o, 0, 0, &self.zero_slot, 1,
-                    q8, 0, yd, HIDDEN, HIDDEN, q_rows,
+                self.gemv.gemv_grouped_q8_idx(
+                    &self.stream, &self.layers[l].o, 0, 0, &self.zeros_b, &self.dense_idx,
+                    nb, q8, q_rows / 32, yd, HIDDEN, HIDDEN, q_rows,
                 )?;
                 let yd = self.ybufs.get(&HIDDEN).unwrap();
-                self.stream.memcpy_dtoh(yd, &mut attn)?;
+                self.stream
+                    .memcpy_dtoh(&yd.slice(0..nb * HIDDEN), &mut attn_all)?;
                 self.stream.synchronize()?;
             }
             lap!(o_gemv_us);
-            rmsnorm_inplace(&mut attn, Some(&self.layers[l].post_attn_norm), cfg.eps);
 
-            // x = residual + attn; pre_ff = norm(x)
-            for i in 0..HIDDEN {
-                x[i] += attn[i];
+            // --- residual + pre-ff norms (CPU) ---
+            let mut pre_ff_all = vec![0f32; nb * HIDDEN];
+            let mut routed_in_all = vec![0f32; nb * HIDDEN];
+            for (i, x) in xs.iter_mut().enumerate() {
+                let a = &mut attn_all[i * HIDDEN..(i + 1) * HIDDEN];
+                rmsnorm_inplace(a, Some(&self.layers[l].post_attn_norm), cfg.eps);
+                for j in 0..HIDDEN {
+                    x[j] += a[j];
+                }
+                rmsnorm_into(x, Some(&self.layers[l].ffn_norm), cfg.eps, &mut pre_ff_all[i * HIDDEN..(i + 1) * HIDDEN]);
+                rmsnorm_into(x, Some(&self.layers[l].pre_ffw2), cfg.eps, &mut routed_in_all[i * HIDDEN..(i + 1) * HIDDEN]);
             }
-            let mut pre_ff = vec![0f32; HIDDEN];
-            rmsnorm_into(&x, Some(&self.layers[l].ffn_norm), cfg.eps, &mut pre_ff);
 
-            // --- shared MLP: gate_up -> gelu*up -> down, all on GPU, 1 sync ---
+            // --- shared MLP batched, deferred sync ---
             let gu_rows = 2 * cfg.ffn;
-            for (map_k, len) in [(HIDDEN, HIDDEN), (cfg.ffn, cfg.ffn)] {
-                if !self.q8bufs.contains_key(&map_k) {
-                    self.q8bufs
-                        .insert(map_k, self.stream.alloc_zeros::<u8>(len / 32 * ft_cuda::Q8_BLK)?);
-                }
-            }
-            if !self.xbufs.contains_key(&HIDDEN) {
-                self.xbufs.insert(HIDDEN, self.stream.alloc_zeros::<f32>(HIDDEN)?);
-            }
-            for rows in [gu_rows, HIDDEN] {
-                if !self.ybufs.contains_key(&rows) {
-                    self.ybufs.insert(rows, self.stream.alloc_zeros::<f32>(rows)?);
-                }
-            }
+            q8buf!(cfg.ffn);
+            ybuf!(gu_rows);
             {
                 let xd = self.xbufs.get_mut(&HIDDEN).unwrap();
-                self.stream.memcpy_htod(&pre_ff, xd)?;
-            }
-            {
+                self.stream
+                    .memcpy_htod(&pre_ff_all[..nb * HIDDEN], &mut xd.slice_mut(0..nb * HIDDEN))?;
                 let xd = self.xbufs.get(&HIDDEN).unwrap();
-                let q8 = self.q8bufs.get_mut(&HIDDEN).unwrap();
-                self.gemv.quantize_q8(&self.stream, xd, 0, q8, HIDDEN, 1)?;
-            }
-            {
-                let q8 = self.q8bufs.get(&HIDDEN).unwrap();
+                self.gemv
+                    .quantize_q8(&self.stream, xd, HIDDEN, &mut self.q8_preff, HIDDEN, nb)?;
                 let yd = self.ybufs.get_mut(&gu_rows).unwrap();
-                self.gemv.gemv_grouped_q8(
-                    &self.stream, &self.layers[l].gate_up, 0, 0, &self.zero_slot, 1,
-                    q8, 0, yd, gu_rows, gu_rows, HIDDEN,
+                self.gemv.gemv_grouped_q8_idx(
+                    &self.stream, &self.layers[l].gate_up, 0, 0, &self.zeros_b, &self.dense_idx,
+                    nb, &self.q8_preff, HIDDEN / 32, yd, gu_rows, gu_rows, HIDDEN,
                 )?;
-            }
-            {
                 let yd = self.ybufs.get(&gu_rows).unwrap();
                 self.gemv
-                    .gelu_mul_grouped(&self.stream, yd, &mut self.act_dev, cfg.ffn, 1)?;
+                    .gelu_mul_grouped(&self.stream, yd, &mut self.act_dev, cfg.ffn, nb)?;
                 let q8a = self.q8bufs.get_mut(&cfg.ffn).unwrap();
                 self.gemv
-                    .quantize_q8(&self.stream, &self.act_dev, 0, q8a, cfg.ffn, 1)?;
-            }
-            {
+                    .quantize_q8(&self.stream, &self.act_dev, cfg.ffn, q8a, cfg.ffn, nb)?;
                 let q8a = self.q8bufs.get(&cfg.ffn).unwrap();
                 let yd = self.ybufs.get_mut(&HIDDEN).unwrap();
-                self.gemv.gemv_grouped_q8(
-                    &self.stream, &self.layers[l].down, 0, 0, &self.zero_slot, 1,
-                    q8a, 0, yd, HIDDEN, HIDDEN, cfg.ffn,
+                self.gemv.gemv_grouped_q8_idx(
+                    &self.stream, &self.layers[l].down, 0, 0, &self.zeros_b, &self.dense_idx,
+                    nb, q8a, cfg.ffn / 32, yd, HIDDEN, HIDDEN, cfg.ffn,
                 )?;
-                // no download yet: the router (CPU) and expert kernels overlap
-                // with this chain; one joint sync collects shared + routed.
             }
             lap!(shared_mlp_us);
 
-            // --- router (CPU) ---
-            let mut rh = vec![0f32; HIDDEN];
-            rmsnorm_into(&x, None, cfg.eps, &mut rh);
-            let root = (HIDDEN as f32).powf(-0.5);
-            for i in 0..HIDDEN {
-                rh[i] *= self.layers[l].router_scale[i] * root;
-            }
-            let rw = &self.layers[l].router_w;
-            let rh_ref: &[f32] = &rh;
-            let mut logits: Vec<(f32, usize)> = rw
-                .par_chunks(16 * HIDDEN)
-                .enumerate()
-                .flat_map_iter(move |(chunk, rows)| {
-                    rows.chunks_exact(HIDDEN).enumerate().map(move |(i, row)| {
-                        let mut acc = [0f32; 8];
-                        for (cr, cx) in row.chunks_exact(8).zip(rh_ref.chunks_exact(8)) {
-                            for j in 0..8 {
-                                acc[j] += cr[j] * cx[j];
+            // --- router per seq (CPU) ---
+            let mut all_ids: Vec<Vec<u32>> = Vec::with_capacity(nb);
+            let mut all_wts: Vec<Vec<f32>> = Vec::with_capacity(nb);
+            for x in xs.iter() {
+                let mut rh = vec![0f32; HIDDEN];
+                rmsnorm_into(x, None, cfg.eps, &mut rh);
+                let root = (HIDDEN as f32).powf(-0.5);
+                for j in 0..HIDDEN {
+                    rh[j] *= self.layers[l].router_scale[j] * root;
+                }
+                let rw = &self.layers[l].router_w;
+                let rh_ref: &[f32] = &rh;
+                let mut logits: Vec<(f32, usize)> = rw
+                    .par_chunks(16 * HIDDEN)
+                    .enumerate()
+                    .flat_map_iter(move |(chunk, rows)| {
+                        rows.chunks_exact(HIDDEN).enumerate().map(move |(i2, row)| {
+                            let mut acc = [0f32; 8];
+                            for (cr, cx) in row.chunks_exact(8).zip(rh_ref.chunks_exact(8)) {
+                                for j in 0..8 {
+                                    acc[j] += cr[j] * cx[j];
+                                }
                             }
-                        }
-                        (acc.iter().sum::<f32>(), chunk * 16 + i)
+                            (acc.iter().sum::<f32>(), chunk * 16 + i2)
+                        })
                     })
-                })
-                .collect();
-            logits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-            let top = &logits[..cfg.topk];
-            let mx = top[0].0;
-            let exps: Vec<f32> = top.iter().map(|(v, _)| (v - mx).exp()).collect();
-            let denom: f32 = exps.iter().sum();
-            let routed_ids: Vec<u32> = top.iter().map(|&(_, e)| e as u32).collect();
-            let routed_wts: Vec<f32> = top
-                .iter()
-                .zip(&exps)
-                .map(|(&(_, e), &xv)| xv / denom * self.layers[l].per_expert_scale[e])
-                .collect();
-
+                    .collect();
+                logits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                let top = &logits[..cfg.topk];
+                let mx = top[0].0;
+                let exps: Vec<f32> = top.iter().map(|(v, _)| (v - mx).exp()).collect();
+                let denom: f32 = exps.iter().sum();
+                all_ids.push(top.iter().map(|&(_, e)| e as u32).collect());
+                all_wts.push(
+                    top.iter()
+                        .zip(&exps)
+                        .map(|(&(_, e), &xv)| xv / denom * self.layers[l].per_expert_scale[e])
+                        .collect(),
+                );
+            }
             lap!(router_us);
-            // --- routed experts through the offload engine ---
-            let mut routed_in = vec![0f32; HIDDEN];
-            rmsnorm_into(&x, Some(&self.layers[l].pre_ffw2), cfg.eps, &mut routed_in);
-            let cpu_part = self.moe_launch(l, &routed_ids, &routed_wts, &routed_in)?;
-            // joint download: shared-MLP result + GPU expert partial, one sync
-            let mut shared = vec![0f32; HIDDEN];
-            let mut routed = vec![0f32; HIDDEN];
+
+            // --- routed experts: batched (seq,expert) pairs ---
+            {
+                let xd = self.xbufs.get_mut(&HIDDEN).unwrap();
+                self.stream.memcpy_htod(
+                    &routed_in_all[..nb * HIDDEN],
+                    &mut xd.slice_mut(0..nb * HIDDEN),
+                )?;
+                let xd = self.xbufs.get(&HIDDEN).unwrap();
+                self.gemv
+                    .quantize_q8(&self.stream, xd, HIDDEN, &mut self.q8_routed, HIDDEN, nb)?;
+            }
+            self.pair_slots_h.clear();
+            self.pair_xidx_h.clear();
+            self.pair_wts_h.clear();
+            self.pair_seq_h.clear();
+            let mut cpu_pairs: Vec<(usize, u32, f32)> = Vec::new(); // (seq, expert, wt)
+            for (i, ids) in all_ids.iter().enumerate() {
+                let lk = self.moe.cache.lookup(l as u32, ids);
+                let miss_ids: Vec<u32> = lk.misses.iter().map(|&(e, _)| e).collect();
+                let (fetch_ids, cpu_ids) = split_misses(&miss_ids, self.moe.fraction);
+                for &e in &cpu_ids {
+                    self.moe.cache.forget(l as u32, e);
+                    let w = all_wts[i][ids.iter().position(|&x2| x2 == e).unwrap()];
+                    cpu_pairs.push((i, e, w));
+                }
+                let slot_of = |e: u32| lk.misses.iter().find(|&&(me, _)| me == e).unwrap().1;
+                for &e in &fetch_ids {
+                    let slot = slot_of(e) as usize;
+                    let off = (l * cfg.n_experts + e as usize) * self.moe.eb;
+                    let hs = self.moe.banks.as_slice();
+                    let mut dst = self
+                        .moe
+                        .cache_buf
+                        .slice_mut(slot * self.moe.eb..(slot + 1) * self.moe.eb);
+                    self.copy_stream
+                        .memcpy_htod(&hs[off..off + self.moe.eb], &mut dst)?;
+                }
+                for &(e, cslot) in lk
+                    .hits
+                    .iter()
+                    .chain(fetch_ids.iter().map(|&e| (e, slot_of(e))).collect::<Vec<_>>().iter())
+                {
+                    let w = all_wts[i][ids.iter().position(|&x2| x2 == e).unwrap()];
+                    self.pair_slots_h.push(cslot as i32);
+                    self.pair_xidx_h.push(i as i32);
+                    self.pair_wts_h.push(w);
+                    self.pair_seq_h.push(i as i32);
+                }
+            }
+            let ev = self.copy_stream.record_event(None)?;
+            self.stream.wait(&ev)?;
+            let n_pairs = self.pair_slots_h.len();
+            {
+                let mut r = self.routed_out_dev.slice_mut(0..nb * HIDDEN);
+                self.stream.memset_zeros(&mut r)?;
+            }
+            if n_pairs > 0 {
+                {
+                    let mut sd = self.pair_slots.slice_mut(0..n_pairs);
+                    self.stream.memcpy_htod(&self.pair_slots_h, &mut sd)?;
+                    let mut xd = self.pair_xidx.slice_mut(0..n_pairs);
+                    self.stream.memcpy_htod(&self.pair_xidx_h, &mut xd)?;
+                    let mut wd = self.pair_wts.slice_mut(0..n_pairs);
+                    self.stream.memcpy_htod(&self.pair_wts_h, &mut wd)?;
+                    let mut qd = self.pair_seq.slice_mut(0..n_pairs);
+                    self.stream.memcpy_htod(&self.pair_seq_h, &mut qd)?;
+                }
+                let gu_rows_e = 2 * cfg.moe_inter;
+                self.gemv.gemv_grouped_q8_idx(
+                    &self.stream, &self.moe.cache_buf, self.moe.eb, 0, &self.pair_slots,
+                    &self.pair_xidx, n_pairs, &self.q8_routed, HIDDEN / 32,
+                    &mut self.pair_y_gu, gu_rows_e, gu_rows_e, HIDDEN,
+                )?;
+                self.gemv.gelu_mul_grouped(
+                    &self.stream, &self.pair_y_gu, &mut self.pair_act, cfg.moe_inter, n_pairs,
+                )?;
+                self.gemv.quantize_q8(
+                    &self.stream, &self.pair_act, cfg.moe_inter, &mut self.pair_act_q8,
+                    cfg.moe_inter, n_pairs,
+                )?;
+                self.gemv.gemv_grouped_q8_idx(
+                    &self.stream, &self.moe.cache_buf, self.moe.eb, self.moe.gu_bytes,
+                    &self.pair_slots, &self.dense_idx, n_pairs, &self.pair_act_q8,
+                    cfg.moe_inter / 32, &mut self.pair_y_down, HIDDEN, HIDDEN, cfg.moe_inter,
+                )?;
+                self.gemv.reduce_pairs_weighted(
+                    &self.stream, &self.pair_y_down, &self.pair_wts, &self.pair_seq,
+                    &mut self.routed_out_dev, HIDDEN, n_pairs, nb,
+                )?;
+            }
+
+            // CPU expert pairs, overlapped with the queued GPU work
+            let mut cpu_parts = vec![0f32; nb * HIDDEN];
+            if !cpu_pairs.is_empty() {
+                let inter = cfg.moe_inter;
+                let x8s: Vec<q4_0::Q8Vec> = xs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        q4_0::Q8Vec::quantize(&routed_in_all[i * HIDDEN..(i + 1) * HIDDEN])
+                    })
+                    .collect();
+                let banks = self.moe.banks.as_slice();
+                let eb = self.moe.eb;
+                let gu_bytes = self.moe.gu_bytes;
+                let n_experts = cfg.n_experts;
+                let parts: Vec<(usize, Vec<f32>)> = cpu_pairs
+                    .par_iter()
+                    .map(|&(i, e, w)| {
+                        let off = (l * n_experts + e as usize) * eb;
+                        let mut ygu = vec![0f32; 2 * inter];
+                        q4_0::gemv_q8(&banks[off..off + gu_bytes], &x8s[i], &mut ygu);
+                        let mut act = vec![0f32; inter];
+                        for j in 0..inter {
+                            act[j] = gelu_tanh(ygu[j]) * ygu[j + inter];
+                        }
+                        let mut ydn = vec![0f32; HIDDEN];
+                        q4_0::gemv(&banks[off + gu_bytes..off + eb], &act, &mut ydn);
+                        for v in ydn.iter_mut() {
+                            *v *= w;
+                        }
+                        (i, ydn)
+                    })
+                    .collect();
+                for (i, part) in parts {
+                    for j in 0..HIDDEN {
+                        cpu_parts[i * HIDDEN + j] += part[j];
+                    }
+                }
+            }
+
+            // --- joint download: shared + routed; combine per seq ---
+            let mut shared_all = vec![0f32; nb * HIDDEN];
+            let mut routed_all = vec![0f32; nb * HIDDEN];
             {
                 let yd = self.ybufs.get(&HIDDEN).unwrap();
-                self.stream.memcpy_dtoh(yd, &mut shared)?;
-                self.stream.memcpy_dtoh(&self.moe.out_dev, &mut routed)?;
+                self.stream
+                    .memcpy_dtoh(&yd.slice(0..nb * HIDDEN), &mut shared_all)?;
+                self.stream
+                    .memcpy_dtoh(&self.routed_out_dev.slice(0..nb * HIDDEN), &mut routed_all)?;
                 self.stream.synchronize()?;
             }
-            for i in 0..HIDDEN {
-                routed[i] += cpu_part[i];
+            for (i, x) in xs.iter_mut().enumerate() {
+                let sh = &shared_all[i * HIDDEN..(i + 1) * HIDDEN];
+                let mut ro = routed_all[i * HIDDEN..(i + 1) * HIDDEN].to_vec();
+                for j in 0..HIDDEN {
+                    ro[j] += cpu_parts[i * HIDDEN + j];
+                }
+                let mut n1 = vec![0f32; HIDDEN];
+                rmsnorm_into(sh, Some(&self.layers[l].post_ffw1), cfg.eps, &mut n1);
+                let mut n2 = vec![0f32; HIDDEN];
+                rmsnorm_into(&ro, Some(&self.layers[l].post_ffw2), cfg.eps, &mut n2);
+                for j in 0..HIDDEN {
+                    n1[j] += n2[j];
+                }
+                let combined = n1.clone();
+                rmsnorm_into(&combined, Some(&self.layers[l].post_ffw), cfg.eps, &mut n1);
+                let ls = self.layers[l].layer_scalar;
+                for j in 0..HIDDEN {
+                    x[j] = (x[j] + n1[j]) * ls;
+                }
             }
             lap!(moe_us);
-
-            // --- dual-rmsnorm combine ---
-            let mut n1 = vec![0f32; HIDDEN];
-            rmsnorm_into(&shared, Some(&self.layers[l].post_ffw1), cfg.eps, &mut n1);
-            let mut n2 = vec![0f32; HIDDEN];
-            rmsnorm_into(&routed, Some(&self.layers[l].post_ffw2), cfg.eps, &mut n2);
-            for i in 0..HIDDEN {
-                n1[i] += n2[i];
-            }
-            let combined = n1.clone();
-            rmsnorm_into(&combined, Some(&self.layers[l].post_ffw), cfg.eps, &mut n1);
-            let ls = self.layers[l].layer_scalar;
-            for i in 0..HIDDEN {
-                x[i] = (x[i] + n1[i]) * ls;
-            }
-            lap!(combine_us);
         }
 
-        // final norm + tied q6_k lm_head + softcap
-        let xin = x.clone();
-        rmsnorm_into(&xin, Some(&self.final_norm), cfg.eps, &mut x);
-        if !self.xbufs.contains_key(&HIDDEN) {
-            self.xbufs
-                .insert(HIDDEN, self.stream.alloc_zeros::<f32>(HIDDEN)?);
+        // --- final norm + batched q4 lm_head + softcap ---
+        for (i, x) in xs.iter_mut().enumerate() {
+            let xin = x.clone();
+            rmsnorm_into(&xin, Some(&self.final_norm), cfg.eps, x);
+            h_all[i * HIDDEN..(i + 1) * HIDDEN].copy_from_slice(x);
         }
-        let xd = self.xbufs.get_mut(&HIDDEN).unwrap();
-        self.stream.memcpy_htod(&x, xd)?;
+        lap!(combine_us);
         {
+            let xd = self.xbufs.get_mut(&HIDDEN).unwrap();
+            self.stream
+                .memcpy_htod(&h_all[..nb * HIDDEN], &mut xd.slice_mut(0..nb * HIDDEN))?;
             let xd = self.xbufs.get(&HIDDEN).unwrap();
-            let q8 = self.q8bufs.get_mut(&HIDDEN).unwrap();
-            self.gemv.quantize_q8(&self.stream, xd, 0, q8, HIDDEN, 1)?;
+            self.gemv
+                .quantize_q8(&self.stream, xd, HIDDEN, &mut self.q8_preff, HIDDEN, nb)?;
+            self.gemv.gemv_grouped_q8_idx(
+                &self.stream, &self.lm_head_q4, 0, 0, &self.zeros_b, &self.dense_idx,
+                nb, &self.q8_preff, HIDDEN / 32, &mut self.logits_dev, cfg.vocab,
+                cfg.vocab, HIDDEN,
+            )?;
         }
-        let q8 = self.q8bufs.get(&HIDDEN).unwrap();
-        self.gemv.gemv_grouped_q8(
-            &self.stream, &self.lm_head_q4, 0, 0, &self.zero_slot, 1,
-            q8, 0, &mut self.logits_dev, cfg.vocab, cfg.vocab, HIDDEN,
-        )?;
-        let mut logits = vec![0f32; cfg.vocab];
-        self.stream.memcpy_dtoh(&self.logits_dev, &mut logits)?;
+        let mut logits_all = vec![0f32; nb * cfg.vocab];
+        self.stream
+            .memcpy_dtoh(&self.logits_dev.slice(0..nb * cfg.vocab), &mut logits_all)?;
         self.stream.synchronize()?;
         let cap = cfg.softcap;
-        for v in logits.iter_mut() {
-            *v = (*v / cap).tanh() * cap;
+        let mut out = Vec::with_capacity(nb);
+        for (i, &(slot, _)) in reqs.iter().enumerate() {
+            let mut lg = logits_all[i * cfg.vocab..(i + 1) * cfg.vocab].to_vec();
+            for v in lg.iter_mut() {
+                *v = (*v / cap).tanh() * cap;
+            }
+            out.push(lg);
+            self.seq_pos[slot] += 1;
         }
+        self.prof.tokens += nb as u64;
         lap!(lm_head_us);
-        self.prof.tokens += 1;
-        self.seq_len += 1;
-        Ok(logits)
-    }
-
-    /// Hybrid expert launch for one layer: enqueues fetches + GPU expert
-    /// kernels (async, after whatever is already queued on the compute
-    /// stream) and computes the CPU-split experts inline. The GPU partial is
-    /// left in `moe.out_dev`; the returned vec is the CPU partial.
-    fn moe_launch(
-        &mut self,
-        layer: usize,
-        ids: &[u32],
-        wts: &[f32],
-        x_in: &[f32],
-    ) -> Result<Vec<f32>> {
-        let inter = self.cfg.moe_inter;
-        let lk = self.moe.cache.lookup(layer as u32, ids);
-        let miss_ids: Vec<u32> = lk.misses.iter().map(|&(e, _)| e).collect();
-        let (fetch_ids, cpu_ids) = split_misses(&miss_ids, self.moe.fraction);
-        // CPU-served misses never land in their assigned GPU slot: un-admit
-        // them or the next route becomes a false hit on stale slot contents.
-        for &e in &cpu_ids {
-            self.moe.cache.forget(layer as u32, e);
-        }
-        let slot_of = |e: u32| lk.misses.iter().find(|&&(me, _)| me == e).unwrap().1;
-        let wt_of = |e: u32| wts[ids.iter().position(|&i| i == e).unwrap()];
-
-        for &e in &fetch_ids {
-            let slot = slot_of(e) as usize;
-            let off = (layer * self.cfg.n_experts + e as usize) * self.moe.eb;
-            let hs = self.moe.banks.as_slice();
-            let mut dst = self
-                .moe
-                .cache_buf
-                .slice_mut(slot * self.moe.eb..(slot + 1) * self.moe.eb);
-            self.copy_stream
-                .memcpy_htod(&hs[off..off + self.moe.eb], &mut dst)?;
-        }
-        let ev = self.copy_stream.record_event(None)?;
-        self.stream.wait(&ev)?;
-
-        let gpu: Vec<(u32, u32)> = lk
-            .hits
-            .iter()
-            .copied()
-            .chain(fetch_ids.iter().map(|&e| (e, slot_of(e))))
-            .collect();
-        let n = gpu.len();
-        self.stream.memset_zeros(&mut self.moe.out_dev)?;
-        self.stream.memcpy_htod(x_in, &mut self.moe.x_dev)?;
-        if n > 0 {
-            self.moe.slots_host.clear();
-            self.moe.slots_host.extend(gpu.iter().map(|&(_, s)| s as i32));
-            self.moe.wts_host.clear();
-            self.moe.wts_host.extend(gpu.iter().map(|&(e, _)| wt_of(e)));
-            {
-                let mut sd = self.moe.slots_dev.slice_mut(0..n);
-                self.stream.memcpy_htod(&self.moe.slots_host, &mut sd)?;
-                let mut wd = self.moe.wts_dev.slice_mut(0..n);
-                self.stream.memcpy_htod(&self.moe.wts_host, &mut wd)?;
-            }
-            let gu_rows = 2 * inter;
-            self.gemv
-                .quantize_q8(&self.stream, &self.moe.x_dev, 0, &mut self.moe.x_q8, HIDDEN, 1)?;
-            self.gemv.gemv_grouped_q8(
-                &self.stream,
-                &self.moe.cache_buf,
-                self.moe.eb,
-                0,
-                &self.moe.slots_dev,
-                n,
-                &self.moe.x_q8,
-                0,
-                &mut self.moe.y_gu,
-                gu_rows,
-                gu_rows,
-                HIDDEN,
-            )?;
-            self.gemv
-                .gelu_mul_grouped(&self.stream, &self.moe.y_gu, &mut self.moe.act, inter, n)?;
-            self.gemv
-                .quantize_q8(&self.stream, &self.moe.act, inter, &mut self.moe.act_q8, inter, n)?;
-            self.gemv.gemv_grouped_q8(
-                &self.stream,
-                &self.moe.cache_buf,
-                self.moe.eb,
-                self.moe.gu_bytes,
-                &self.moe.slots_dev,
-                n,
-                &self.moe.act_q8,
-                inter / 32,
-                &mut self.moe.y_down,
-                HIDDEN,
-                HIDDEN,
-                inter,
-            )?;
-            self.gemv.reduce_expert_weighted(
-                &self.stream,
-                &self.moe.y_down,
-                &self.moe.wts_dev,
-                &mut self.moe.out_dev,
-                HIDDEN,
-                n,
-            )?;
-        }
-
-        let mut cpu_part = vec![0f32; HIDDEN];
-        if !cpu_ids.is_empty() {
-            let x8 = q4_0::Q8Vec::quantize(x_in);
-            let mut ygu = vec![0f32; 2 * inter];
-            let mut act = vec![0f32; inter];
-            let mut ydn = vec![0f32; HIDDEN];
-            for &e in &cpu_ids {
-                let off = (layer * self.cfg.n_experts + e as usize) * self.moe.eb;
-                let hs = self.moe.banks.as_slice();
-                q4_0::gemv_q8(&hs[off..off + self.moe.gu_bytes], &x8, &mut ygu);
-                for i in 0..inter {
-                    act[i] = gelu_tanh(ygu[i]) * ygu[i + inter];
-                }
-                q4_0::gemv(&hs[off + self.moe.gu_bytes..off + self.moe.eb], &act, &mut ydn);
-                let w = wt_of(e);
-                for i in 0..HIDDEN {
-                    cpu_part[i] += w * ydn[i];
-                }
-            }
-        }
-
-        Ok(cpu_part)
+        Ok(out)
     }
 }

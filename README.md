@@ -48,6 +48,16 @@ fewer per-layer syncs, continuous batching. The Python engine's remaining
 lead (native stack: 91.8 tok/s on the same GPU) is its CUDA graphs and fused
 launch structure, not the language.
 
+## Concurrency
+
+`serve` implements continuous batching: up to `batch=N` sequences decode as
+one batched forward per step (batched dense/expert/lm_head GEMVs via an
+activation-indirection kernel; per-slot KV caches; prefill on admission;
+finished sequences free their slot immediately). 8 concurrent requests
+complete in 5.5 s wall vs 9.1 s serialized, with max per-request latency
+down from 14 s to 5.5 s — batched output verified token-identical to
+single-stream decoding.
+
 ```
 cargo test --release          # unit + GPU parity tests
 cargo run --release -p ft-bench            # calibrate pcie/cpu bandwidth, q* fraction

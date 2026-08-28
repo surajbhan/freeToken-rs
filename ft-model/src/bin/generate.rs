@@ -36,7 +36,7 @@ fn main() -> Result<()> {
     let g = Gguf::open(&path)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let ctx = CudaContext::new(0)?;
-    let mut model = Model::load(&g, &ctx, slots, fraction)?;
+    let mut model = Model::load(&g, &ctx, slots, fraction, 1)?;
     eprintln!(
         "loaded {} layers, {} experts, cache {slots} slots in {:.1}s",
         model.cfg.n_layers,

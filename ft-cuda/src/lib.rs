@@ -63,6 +63,8 @@ pub struct Q4Gemv {
     grouped_v3: CudaFunction,
     q6k_q8: CudaFunction,
     attn: CudaFunction,
+    grouped_v3_idx: CudaFunction,
+    reduce_pairs: CudaFunction,
 }
 
 /// bytes per 32-element q8 activation block (f32 d, f32 s, 32x i8)
@@ -85,7 +87,9 @@ impl Q4Gemv {
         let grouped_v3 = module.load_function("gemv_q4_0_grouped_v3")?;
         let q6k_q8 = module.load_function("gemv_q6_k_q8")?;
         let attn = module.load_function("attn_decode")?;
-        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn })
+        let grouped_v3_idx = module.load_function("gemv_q4_0_grouped_v3_idx")?;
+        let reduce_pairs = module.load_function("reduce_pairs_weighted")?;
+        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn, grouped_v3_idx, reduce_pairs })
     }
 
     /// One launch computing y[e] = W_e x_e for every routed expert of a layer.
@@ -163,6 +167,68 @@ impl Q4Gemv {
         Ok(())
     }
 
+    /// v3 grouped GEMV with activation indirection: entry e reads q8 row
+    /// x_idx[e]. For batched MoE (seq,expert) pairs and batched dense ops.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_grouped_q8_idx(
+        &self,
+        stream: &Arc<CudaStream>,
+        cache: &CudaSlice<u8>,
+        expert_bytes: usize,
+        bank_off: usize,
+        slots: &CudaSlice<i32>,
+        x_idx: &CudaSlice<i32>,
+        n_entries: usize,
+        q8: &CudaSlice<u8>,
+        q8_stride_blocks: usize,
+        y: &mut CudaSlice<f32>,
+        y_stride: usize,
+        n_rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        assert_eq!(k % 32, 0);
+        let nblocks = k / 32;
+        assert!(slots.len() >= n_entries && x_idx.len() >= n_entries);
+        assert!(y.len() >= n_entries * y_stride);
+        let (eb, off) = (expert_bytes as u64, bank_off as u64);
+        let (qs, ys) = (q8_stride_blocks as i32, y_stride as i32);
+        let (nr, ki) = (n_rows as i32, k as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows.div_ceil(4) as u32, n_entries as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: (nblocks * Q8_BLK) as u32,
+        };
+        let mut lb = stream.launch_builder(&self.grouped_v3_idx);
+        lb.arg(cache).arg(&eb).arg(&off).arg(slots).arg(x_idx).arg(q8).arg(&qs).arg(y).arg(&ys).arg(&nr).arg(&ki);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// out[s] += sum of pair outputs with seq_of[p]==s, weighted by wts[p].
+    #[allow(clippy::too_many_arguments)]
+    pub fn reduce_pairs_weighted(
+        &self,
+        stream: &Arc<CudaStream>,
+        y: &CudaSlice<f32>,
+        wts: &CudaSlice<f32>,
+        seq_of: &CudaSlice<i32>,
+        out: &mut CudaSlice<f32>,
+        hidden: usize,
+        n_pairs: usize,
+        n_seqs: usize,
+    ) -> Result<()> {
+        let (h, np) = (hidden as i32, n_pairs as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (hidden.div_ceil(256) as u32, n_seqs as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.reduce_pairs);
+        lb.arg(y).arg(wts).arg(seq_of).arg(out).arg(&h).arg(&np);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
     /// attn_decode over view q/out (sliced per layer geometry).
     #[allow(clippy::too_many_arguments)]
     pub fn attn_decode_view(
@@ -201,11 +267,13 @@ impl Q4Gemv {
         Ok(())
     }
 
-    /// quantize_q8 over a device view (single shared vector).
+    /// quantize_q8 over a device view; x_stride separates per-entry rows
+    /// (0 shares one vector across entries).
     pub fn quantize_q8_view(
         &self,
         stream: &Arc<CudaStream>,
         x: &CudaView<'_, f32>,
+        x_stride: usize,
         q8: &mut CudaSlice<u8>,
         k: usize,
         n_experts: usize,
@@ -214,7 +282,7 @@ impl Q4Gemv {
         let nblocks = k / 32;
         assert!(q8.len() >= n_experts * nblocks * Q8_BLK);
         let total_warps = n_experts * nblocks;
-        let (xs, nb, ne) = (0i32, nblocks as i32, n_experts as i32);
+        let (xs, nb, ne) = (x_stride as i32, nblocks as i32, n_experts as i32);
         let cfg = LaunchConfig {
             grid_dim: ((total_warps * 32).div_ceil(256) as u32, 1, 1),
             block_dim: (256, 1, 1),
