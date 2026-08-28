@@ -86,12 +86,17 @@ targets. Python FreeToken cannot start on this machine at all — its torch 2.11
 pin is a CUDA-13 build requiring driver >= 580.
 
 **Unified memory (Apple M4 Pro mac mini, 64 GB)**: llama.cpp running
-*CPU-only* does **32.8 tok/s** on the same model — ~4x the best any engine
-achieves on the 4 GB discrete GPU. On Apple Silicon every compute unit reads
-the full model at memory bandwidth, so the problem this engine exists to
-manage (experts stranded behind a PCIe link) does not arise; an expert cache
-would cache into the same memory it fetches from. (Metal full-offload was not
-measurable on this particular box — a Docker VM had 43 GB wired.)
+*CPU-only* does **32.8 tok/s** on the same model, and the box's resident
+`mlx_lm.server` sustains **~47 tok/s** (warm) on a comparable MoE
+(Qwen3.5-35B-A3B, 8-bit) — 4-6x the best any engine achieves on the 4 GB
+discrete GPU. On Apple Silicon every compute unit reads the full model at
+memory bandwidth, so the problem this engine exists to manage (experts
+stranded behind a PCIe link) does not arise; an expert cache would cache into
+the same memory it fetches from. Where the FreeToken idea *would* transfer to
+Macs: MoE models larger than unified memory, with the same cache + q\* split
+applied one level down (SSD -> RAM expert streaming). (Metal full-offload of
+our model was not measurable on this box — the MLX server keeps ~35 GB
+wired.)
 
 ## Concurrency
 
