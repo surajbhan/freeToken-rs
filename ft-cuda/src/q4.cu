@@ -463,3 +463,70 @@ extern "C" __global__ void gemv_q6_k_q8(
         acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
     if (sub == 0) y[row] = acc;
 }
+
+// ---- decode attention (bs=1): one block per query head ----
+// K/V cached as f16 [max_seq, kv_dim]; scores staged in dynamic smem
+// (ctx * 4B). Two-pass softmax; GQA maps query head h -> kv head h/group.
+// sm_scale = 1.0 (gemma4: q/k are per-head RMS-normed).
+extern "C" __global__ void attn_decode(
+    const __half* __restrict__ kc,   // [max_seq, kv_dim]
+    const __half* __restrict__ vc,   // [max_seq, kv_dim]
+    const float* __restrict__ q,     // [n_heads, hd]
+    float* __restrict__ out,         // [n_heads, hd]
+    int kv_start,
+    int kv_end,                       // exclusive
+    int kv_dim,
+    int hd,
+    int group)
+{
+    extern __shared__ float sc[];    // kv_end - kv_start scores
+    int h = blockIdx.x;
+    int g = h / group;
+    const float* qh = q + (size_t)h * hd;
+    int n = kv_end - kv_start;
+
+    // pass 1: scores
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const __half* kt = kc + (size_t)(kv_start + i) * kv_dim + (size_t)g * hd;
+        float s = 0.0f;
+        for (int d = 0; d < hd; ++d) s += qh[d] * __half2float(kt[d]);
+        sc[i] = s;
+    }
+    __syncthreads();
+
+    // block max + exp-sum (thread-strided, then smem tree on 128 partials)
+    __shared__ float red[128];
+    float m = -1e30f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, sc[i]);
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s2]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float e = __expf(sc[i] - m);
+        sc[i] = e;
+        sum += e;
+    }
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] += red[threadIdx.x + s2];
+        __syncthreads();
+    }
+    float inv = 1.0f / red[0];
+    __syncthreads();
+
+    // pass 2: out[d] = sum_p w_p * V[p][d]
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        const __half* v0 = vc + (size_t)kv_start * kv_dim + (size_t)g * hd + d;
+        for (int i = 0; i < n; ++i)
+            acc += sc[i] * __half2float(v0[(size_t)i * kv_dim]);
+        out[(size_t)h * hd + d] = acc * inv;
+    }
+}

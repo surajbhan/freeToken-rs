@@ -36,16 +36,17 @@ finish together.
 | engine | tok/s | ms/token | notes |
 |---|---|---|---|
 | freeToken-rs, first working build | 16.0 | 63 | CPU attention, f32 kernels |
-| freeToken-rs, profiled + optimized | **30.4** | **33** | dp4a kernels, rope tables, parallel router, fused MLP chain |
+| freeToken-rs, profiled + optimized | 30.4 | 33 | dp4a kernels, rope tables, parallel router, fused MLP chain |
+| freeToken-rs, + GPU attention & q4 lm_head | **42.2** | **24** | f16 KV cache on GPU, flash-decode kernel, overlapped MLP/MoE |
 | Python FreeToken, Triton fallback (driver 550) | 68.0 | 14.7 | CUDA graphs, Triton attention |
 | Python FreeToken, native accel (driver 580) | 91.8 | 10.9 | flashinfer + sglang-kernel |
 
-Per-token profile after optimization (30 layers): moe 10.0 · lm_head 9.2 ·
-attn-cpu 3.7 · router 3.4 · qkv+o gemv 4.8 · shared-mlp 2.4 · rope/norms 1.2 ms.
-Known headroom, in order: GPU attention (removes ~7 ms of CPU work + 2
-syncs/layer), a wider lm_head kernel, CUDA-graphing the decode step, and
-continuous batching. The Python engine's remaining lead is exactly its CUDA
-graphs + fused attention path, not the language.
+Per-token profile at 42 tok/s (30 layers, 400-token context): moe 8.5 ·
+lm_head 4.2 · router 3.6 · attn+o 3.7 · qkv 2.3 · shared-mlp 0.7 ·
+rope/norms 0.9 ms. Known headroom: CUDA-graphing the decode step, GPU router,
+fewer per-layer syncs, continuous batching. The Python engine's remaining
+lead (native stack: 91.8 tok/s on the same GPU) is its CUDA graphs and fused
+launch structure, not the language.
 
 ```
 cargo test --release          # unit + GPU parity tests

@@ -3,7 +3,8 @@
 
 use anyhow::{bail, Result};
 use cudarc::driver::{
-    sys, CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg,
+    sys, CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig,
+    PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
@@ -61,6 +62,7 @@ pub struct Q4Gemv {
     quant_q8: CudaFunction,
     grouped_v3: CudaFunction,
     q6k_q8: CudaFunction,
+    attn: CudaFunction,
 }
 
 /// bytes per 32-element q8 activation block (f32 d, f32 s, 32x i8)
@@ -82,7 +84,8 @@ impl Q4Gemv {
         let quant_q8 = module.load_function("quantize_q8_grouped")?;
         let grouped_v3 = module.load_function("gemv_q4_0_grouped_v3")?;
         let q6k_q8 = module.load_function("gemv_q6_k_q8")?;
-        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8 })
+        let attn = module.load_function("attn_decode")?;
+        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn })
     }
 
     /// One launch computing y[e] = W_e x_e for every routed expert of a layer.
@@ -117,6 +120,108 @@ impl Q4Gemv {
         };
         let mut lb = stream.launch_builder(&self.grouped);
         lb.arg(cache).arg(&eb).arg(&off).arg(slots).arg(x).arg(&xs).arg(y).arg(&ys).arg(&nr).arg(&ki);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// Decode attention, one block per query head. K/V are f16 stored as u16
+    /// buffers [max_seq, kv_dim]; smem = (kv_end-kv_start)*4 bytes of scores.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode(
+        &self,
+        stream: &Arc<CudaStream>,
+        kc: &CudaSlice<u16>,
+        vc: &CudaSlice<u16>,
+        q: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        kv_start: usize,
+        kv_end: usize,
+        kv_dim: usize,
+        hd: usize,
+        group: usize,
+        n_heads: usize,
+    ) -> Result<()> {
+        let n = kv_end - kv_start;
+        assert!(n > 0);
+        let smem = n * 4;
+        assert!(smem <= 48 * 1024, "context too long for smem scores");
+        let (a, b, c, d, e) = (
+            kv_start as i32,
+            kv_end as i32,
+            kv_dim as i32,
+            hd as i32,
+            group as i32,
+        );
+        let cfg = LaunchConfig {
+            grid_dim: (n_heads as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: smem as u32,
+        };
+        let mut lb = stream.launch_builder(&self.attn);
+        lb.arg(kc).arg(vc).arg(q).arg(out).arg(&a).arg(&b).arg(&c).arg(&d).arg(&e);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// attn_decode over view q/out (sliced per layer geometry).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_view(
+        &self,
+        stream: &Arc<CudaStream>,
+        kc: &CudaSlice<u16>,
+        vc: &CudaSlice<u16>,
+        q: &CudaView<'_, f32>,
+        out: &mut CudaViewMut<'_, f32>,
+        kv_start: usize,
+        kv_end: usize,
+        kv_dim: usize,
+        hd: usize,
+        group: usize,
+        n_heads: usize,
+    ) -> Result<()> {
+        let n = kv_end - kv_start;
+        assert!(n > 0);
+        let smem = n * 4;
+        assert!(smem <= 48 * 1024, "context too long for smem scores");
+        let (a, b, c, d, e) = (
+            kv_start as i32,
+            kv_end as i32,
+            kv_dim as i32,
+            hd as i32,
+            group as i32,
+        );
+        let cfg = LaunchConfig {
+            grid_dim: (n_heads as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: smem as u32,
+        };
+        let mut lb = stream.launch_builder(&self.attn);
+        lb.arg(kc).arg(vc).arg(q).arg(out).arg(&a).arg(&b).arg(&c).arg(&d).arg(&e);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// quantize_q8 over a device view (single shared vector).
+    pub fn quantize_q8_view(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &CudaView<'_, f32>,
+        q8: &mut CudaSlice<u8>,
+        k: usize,
+        n_experts: usize,
+    ) -> Result<()> {
+        assert_eq!(k % 32, 0);
+        let nblocks = k / 32;
+        assert!(q8.len() >= n_experts * nblocks * Q8_BLK);
+        let total_warps = n_experts * nblocks;
+        let (xs, nb, ne) = (0i32, nblocks as i32, n_experts as i32);
+        let cfg = LaunchConfig {
+            grid_dim: ((total_warps * 32).div_ceil(256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.quant_q8);
+        lb.arg(x).arg(&xs).arg(q8).arg(&nb).arg(&ne);
         unsafe { lb.launch(cfg)? };
         Ok(())
     }
