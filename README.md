@@ -40,31 +40,45 @@ finish together.
 | freeToken-rs, + GPU attention & q4 lm_head | 42.2 | 24 | f16 KV cache on GPU, flash-decode kernel, overlapped MLP/MoE |
 | freeToken-rs, GPU-resident decode | 46.8 | 21 | norms/rope/router/combine on device, pooled KV, 1 sync/layer |
 | freeToken-rs, UVA experts + GPU sampling | 62.9 | 16 | misses stream over PCIe inside the kernel; 4-byte/token download |
-| **freeToken-rs, CUDA-graph replay** | **64.8** | **15.4** | device LRU + topk; whole token = one graph launch |
+| freeToken-rs, CUDA-graph replay | 64.8 | 15.4 | device LRU + topk; whole token = one graph launch |
 | Python FreeToken, Triton fallback (driver 550) | 68.0 | 14.7 | CUDA graphs, Triton attention |
+| freeToken-rs, two-phase expert fetch | 63.5 | 15.7 | misses cross PCIe once via copy stream; pair GEMVs read DRAM |
+| freeToken-rs, flash-decode attention | 73.5 | 13.6 | position chunks fan out over SMs; online-softmax partials + merge |
+| **freeToken-rs, fused qkv-prep (current)** | **76.1** | **13.1** | 8 head-op launches -> 1 kernel; fused gelu+q8 quantize |
 | Python FreeToken, native accel (driver 580) | 91.8 | 10.9 | flashinfer + sglang-kernel |
 
-Per-token profile at 42 tok/s (30 layers, 400-token context): moe 8.5 ·
-lm_head 4.2 · router 3.6 · attn+o 3.7 · qkv 2.3 · shared-mlp 0.7 ·
-rope/norms 0.9 ms. Known headroom: CUDA-graphing the decode step, GPU router,
-fewer per-layer syncs, continuous batching. The Python engine's remaining
-lead (native stack: 91.8 tok/s on the same GPU) is its CUDA graphs and fused
-launch structure, not the language.
+Per-token attribution at 76 tok/s, measured by *subtractive graph profiling*
+(re-capture the CUDA graph with one section stubbed out, difference the wall
+times — per-kernel sync timers overstate whatever has the most launches):
+moe pairs 3.6 · dense GEMVs 3.2 · lm_head 2.2 · attention 1.9 · everything
+else ~2.2 ms. The MoE and dense sections sit near the card's ~288 GB/s
+roofline (8 experts x 3.36 MB x 30 layers ≈ 807 MB/token for the pairs
+alone); the residual gap to Python's native stack (~2 ms) is spread thin
+across attention latency, dp4a GEMV efficiency, and launch overhead.
+
+The two-phase fetch matters most when VRAM is short: at 1200 slots (31% of
+the 3840 expert banks resident) decode improved 29.9 -> **46.6 tok/s**,
+because a missed expert now crosses PCIe once by DMA instead of being read
+in-kernel over UVA by both pair GEMVs while blocking SMs.
 
 **GPU-poor hardware** (GTX 1650 4 GB laptop, driver 535): freeToken-rs runs the
 same 26B model at **8.9 tok/s** in hybrid mode (280-slot cache, CPU experts +
-PCIe streaming). Python FreeToken cannot start on this machine at all — its
-torch 2.11 pin is a CUDA-13 build requiring driver >= 580.
+PCIe streaming). Fetch-on-miss GPU routing manages only 5.2 tok/s there (7%
+expert coverage, PCIe 3 — misses dominate), confirming FreeToken's
+bandwidth-adaptive co-execution thesis on exactly the hardware it targets.
+Python FreeToken cannot start on this machine at all — its torch 2.11 pin is
+a CUDA-13 build requiring driver >= 580.
 
 ## Concurrency
 
 `serve` implements continuous batching: up to `batch=N` sequences decode as
 one batched forward per step (batched dense/expert/lm_head GEMVs via an
 activation-indirection kernel; per-slot KV caches; prefill on admission;
-finished sequences free their slot immediately). 8 concurrent requests
-complete in **3.1 s wall** on the graphed batched server (vs 9.1 s
-serialized), max per-request latency 14 s -> 3.1 s — batched output verified
-token-identical to single-stream decoding.
+finished sequences free their slot immediately). With the current kernels,
+8 concurrent requests complete in **3.1 s wall** (was 5.5 s before the
+two-phase/flash-decode round; 9.1 s serialized), 4 requests in 1.8 s, and a
+single request in 0.9 s — batched output verified token-identical to
+single-stream decoding (`btest`).
 
 ```
 cargo test --release          # unit + GPU parity tests

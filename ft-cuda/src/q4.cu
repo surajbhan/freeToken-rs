@@ -249,6 +249,43 @@ extern "C" __global__ void gemv_q6_k(
 
 // out[e][j] = gelu_tanh(gu[e][j]) * gu[e][inter + j] — gemma's expert/MLP
 // activation (gelu_pytorch_tanh), grouped over experts.
+#define Q8_BLK 40
+// fused gelu_tanh(gate)*up -> q8 block quantize (warp per 32-block);
+// removes the intermediate f32 activation buffer and one launch.
+extern "C" __global__ void gelu_mul_q8(
+    const float* __restrict__ gu,   // [n, 2*inter]
+    unsigned char* __restrict__ q8, // [n, (inter/32)*Q8_BLK]
+    int inter, int n)
+{
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    int nblocks = inter >> 5;
+    int e = warp / nblocks, b = warp % nblocks;
+    if (e >= n) return;
+    int j = b * 32 + lane;
+    float g = gu[(size_t)e * 2 * inter + j];
+    float t = tanhf(0.7978845608f * (g + 0.044715f * g * g * g));
+    float v = 0.5f * g * (1.0f + t) * gu[(size_t)e * 2 * inter + inter + j];
+    float a = fabsf(v);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFFu, a, off));
+    float d = a > 0.0f ? a / 127.0f : 0.0f;
+    float inv = d > 0.0f ? 1.0f / d : 0.0f;
+    int q = __float2int_rn(v * inv);
+    q = max(-127, min(127, q));
+    int sq = q;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_xor_sync(0xFFFFFFFFu, sq, off);
+    unsigned char* blk = q8 + ((size_t)e * nblocks + b) * Q8_BLK;
+    if (lane == 0) {
+        *reinterpret_cast<float*>(blk) = d;
+        *reinterpret_cast<float*>(blk + 4) = d * (float)sq;
+    }
+    blk[8 + lane] = (unsigned char)(signed char)q;
+}
+
 extern "C" __global__ void gelu_mul_grouped(const float* __restrict__ gu,
                                             float* __restrict__ out,
                                             int inter, int n_experts)
@@ -282,7 +319,6 @@ extern "C" __global__ void reduce_expert_weighted(const float* __restrict__ y,
 // The GEMV then does 8 dp4a per q4_0 block instead of 32 fp32 FMAs, and the
 // -8 offset folds into s:  dot = d4 * (d8 * sum(q4*q8) - 8 * s8).
 
-#define Q8_BLK 40
 
 // one warp per 32-elem block: x[e*x_stride + b*32 + lane]
 extern "C" __global__ void quantize_q8_grouped(
@@ -590,13 +626,15 @@ extern "C" __global__ void attn_decode_chunk(
     int lane = threadIdx.x & 31;
     int dpl = hd >> 5;
 
-    // scores: warp per position, lanes over d (coalesced K reads)
+    // scores: warp per position, lanes over d in half2 pairs (128B warp reads)
+    int dp2 = hd >> 6; // half2 iterations per lane
     for (int i = warp; i < cn; i += 4) {
-        const __half* kt = kc + (size_t)i * kv_dim;
+        const __half2* kt = reinterpret_cast<const __half2*>(kc + (size_t)i * kv_dim);
         float sv = 0.0f;
-        for (int kdi = 0; kdi < dpl; ++kdi) {
-            int d = lane + (kdi << 5);
-            sv += qh[d] * __half2float(kt[d]);
+        for (int kdi = 0; kdi < dp2; ++kdi) {
+            int d2 = lane + (kdi << 5);
+            float2 kv2 = __half22float2(kt[d2]);
+            sv += qh[2 * d2] * kv2.x + qh[2 * d2 + 1] * kv2.y;
         }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
@@ -631,20 +669,24 @@ extern "C" __global__ void attn_decode_chunk(
     float l = red[0];
     __syncthreads();
 
-    // unnormalized weighted V accumulation
+    // unnormalized weighted V accumulation (half2 loads)
     float acc[16];
 #pragma unroll
     for (int kdi = 0; kdi < 16; ++kdi) acc[kdi] = 0.0f;
     for (int i = warp; i < cn; i += 4) {
         float w = sc[i];
-        const __half* vt = vc + (size_t)i * kv_dim;
-        for (int kdi = 0; kdi < dpl; ++kdi) {
-            int d = lane + (kdi << 5);
-            acc[kdi] += w * __half2float(vt[d]);
+        const __half2* vt = reinterpret_cast<const __half2*>(vc + (size_t)i * kv_dim);
+        for (int kdi = 0; kdi < dp2; ++kdi) {
+            float2 vv = __half22float2(vt[lane + (kdi << 5)]);
+            acc[2 * kdi] += w * vv.x;
+            acc[2 * kdi + 1] += w * vv.y;
         }
     }
-    for (int kdi = 0; kdi < dpl; ++kdi)
-        warp_out[warp * hd + lane + (kdi << 5)] = acc[kdi];
+    for (int kdi = 0; kdi < dp2; ++kdi) {
+        int d2 = lane + (kdi << 5);
+        warp_out[warp * hd + 2 * d2] = acc[2 * kdi];
+        warp_out[warp * hd + 2 * d2 + 1] = acc[2 * kdi + 1];
+    }
     __syncthreads();
     float* pp = partials
         + ((size_t)(s * n_heads + h) * max_chunks + c) * (size_t)(hd + 2);
@@ -967,6 +1009,83 @@ extern "C" __global__ void kv_append(
     float v = qkv[(size_t)s * seq_stride + sec_off + i];
     size_t dst = ((size_t)slot_arr[s] * max_seq + (size_t)pos_arr[s]) * kv_dim + i;
     pool[dst] = __half_as_ushort(__float2half(v));
+}
+
+// fused per-head qkv post-processing for decode: rmsnorm (q/k weighted,
+// v unweighted) + NeoX rope (q/k) + f16 KV-pool append (k/v) + q gather,
+// one block per (head row, seq). Replaces 8 kernel launches per layer.
+extern "C" __global__ void qkv_prep(
+    const float* __restrict__ y,        // [nb, qkv_rows] qkv gemv output
+    float* __restrict__ q_out,          // [nb, n_heads*hd]
+    unsigned short* __restrict__ kpool,
+    unsigned short* __restrict__ vpool,
+    const float* __restrict__ q_norm,   // [hd]
+    const float* __restrict__ k_norm,   // [hd]
+    const float* __restrict__ inv_freq, // [hd/2]
+    const int* __restrict__ slot_arr,
+    const int* __restrict__ pos_arr,
+    float eps,
+    int hd,
+    int n_heads,
+    int kvh,
+    int qkv_rows,
+    int kv_dim,
+    int max_seq)
+{
+    __shared__ float red[128];
+    __shared__ float buf[512];
+    int hidx = blockIdx.x;
+    int s = blockIdx.y;
+    int kind, hoff;
+    if (hidx < n_heads) { kind = 0; hoff = hidx * hd; }
+    else if (hidx < n_heads + kvh) { kind = 1; hoff = (n_heads + (hidx - n_heads)) * hd; }
+    else { kind = 2; hoff = (n_heads + kvh + (hidx - n_heads - kvh)) * hd; }
+    const float* row = y + (size_t)s * qkv_rows + hoff;
+
+    float ss = 0.0f;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float v = row[d];
+        buf[d] = v;
+        ss += v * v;
+    }
+    red[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] += red[threadIdx.x + s2];
+        __syncthreads();
+    }
+    float r = rsqrtf(red[0] / hd + eps);
+    __syncthreads();
+
+    const float* w = (kind == 0) ? q_norm : k_norm;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x)
+        buf[d] *= r * (kind == 2 ? 1.0f : w[d]);
+    __syncthreads();
+
+    if (kind != 2) {
+        int half = hd / 2;
+        int pos = pos_arr[s];
+        for (int i = threadIdx.x; i < half; i += blockDim.x) {
+            float th = pos * inv_freq[i];
+            float sn = __sinf(th), cs = __cosf(th);
+            float a = buf[i], b = buf[i + half];
+            buf[i] = a * cs - b * sn;
+            buf[i + half] = a * sn + b * cs;
+        }
+        __syncthreads();
+    }
+
+    if (kind == 0) {
+        float* dst = q_out + (size_t)s * n_heads * hd + (size_t)hidx * hd;
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) dst[d] = buf[d];
+    } else {
+        unsigned short* pool = (kind == 1) ? kpool : vpool;
+        int kh = (kind == 1) ? hidx - n_heads : hidx - n_heads - kvh;
+        size_t dst = ((size_t)slot_arr[s] * max_seq + (size_t)pos_arr[s]) * kv_dim
+                   + (size_t)kh * hd;
+        for (int d = threadIdx.x; d < hd; d += blockDim.x)
+            pool[dst + d] = __half_as_ushort(__float2half(buf[d]));
+    }
 }
 
 // gemma dual-rmsnorm combine + residual + layer scalar, batched rows:
@@ -1375,7 +1494,7 @@ __device__ __forceinline__ float q4r_row_dot(
     return acc;
 }
 
-extern "C" __global__ void gemv_q4r_grouped_idx(
+extern "C" __global__ void __launch_bounds__(256, 4) gemv_q4r_grouped_idx(
     const unsigned char* __restrict__ base,
     unsigned long long expert_bytes,
     unsigned long long bank_off,
@@ -1412,7 +1531,7 @@ extern "C" __global__ void gemv_q4r_grouped_idx(
     if (lane == 0) y[(size_t)e * y_stride + row] = acc;
 }
 
-extern "C" __global__ void gemv_q4r_grouped_ptr(
+extern "C" __global__ void __launch_bounds__(256, 4) gemv_q4r_grouped_ptr(
     const unsigned long long* __restrict__ bases,
     unsigned long long bank_off,
     const int* __restrict__ x_idx,

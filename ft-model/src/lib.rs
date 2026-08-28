@@ -802,56 +802,15 @@ impl Model {
                 } }
             }
             {
-                let yd = self.ybufs.get_mut(&qkv_rows).unwrap();
-                let n_all = nb * qkv_rows;
-                {
-                    let mut qv = yd.slice_mut(0..n_all);
-                    self.gemv.rmsnorm_heads_dev(
-                        &self.stream, &mut qv, &self.layers[l].q_norm_d, true, hd, cfg.eps,
-                        qkv_rows, cfg.n_heads, nb,
-                    )?;
-                }
-                {
-                    let mut kv2 = yd.slice_mut(q_rows..n_all);
-                    self.gemv.rmsnorm_heads_dev(
-                        &self.stream, &mut kv2, &self.layers[l].k_norm_d, true, hd, cfg.eps,
-                        qkv_rows, kvh, nb,
-                    )?;
-                }
-                {
-                    let mut vv = yd.slice_mut(q_rows + kv_dim..n_all);
-                    self.gemv.rmsnorm_heads_dev(
-                        &self.stream, &mut vv, &self.layers[l].k_norm_d, false, hd, cfg.eps,
-                        qkv_rows, kvh, nb,
-                    )?;
-                }
-                let inv_freq = if cfg.swa[l] { &self.inv_freq_swa_d } else { &self.inv_freq_full_d };
-                {
-                    let mut qv = yd.slice_mut(0..n_all);
-                    self.gemv.rope_heads_dev(
-                        &self.stream, &mut qv, inv_freq, &self.pos_dev, hd, cfg.n_heads,
-                        qkv_rows, nb,
-                    )?;
-                }
-                {
-                    let mut kv2 = yd.slice_mut(q_rows..n_all);
-                    self.gemv.rope_heads_dev(
-                        &self.stream, &mut kv2, inv_freq, &self.pos_dev, hd, kvh, qkv_rows, nb,
-                    )?;
-                }
-            }
-            {
                 let yd = self.ybufs.get(&qkv_rows).unwrap();
-                self.gemv.kv_append_dev(
-                    &self.stream, yd, &mut self.k_pool[l], &self.slot_dev, &self.pos_dev,
-                    q_rows, qkv_rows, kv_dim, cfg.max_seq, nb,
+                let inv_freq = if cfg.swa[l] { &self.inv_freq_swa_d } else { &self.inv_freq_full_d };
+                self.gemv.qkv_prep_dev(
+                    &self.stream, yd, &mut self.attn_out_dev,
+                    &mut self.k_pool[l], &mut self.v_pool[l],
+                    &self.layers[l].q_norm_d, &self.layers[l].k_norm_d, inv_freq,
+                    &self.slot_dev, &self.pos_dev, cfg.eps,
+                    hd, cfg.n_heads, kvh, qkv_rows, kv_dim, cfg.max_seq, nb,
                 )?;
-                self.gemv.kv_append_dev(
-                    &self.stream, yd, &mut self.v_pool[l], &self.slot_dev, &self.pos_dev,
-                    q_rows + kv_dim, qkv_rows, kv_dim, cfg.max_seq, nb,
-                )?;
-                self.gemv
-                    .gather_rows_dev(&self.stream, yd, &mut self.attn_out_dev, qkv_rows, 0, q_rows, nb)?;
             }
             if !skip_attn {
                 self.gemv.attn_decode_batch_dev(
@@ -911,13 +870,8 @@ impl Model {
             }
             {
                 let yd = self.ybufs.get(&gu_rows).unwrap();
-                self.gemv
-                    .gelu_mul_grouped(&self.stream, yd, &mut self.act_dev, cfg.ffn, nb)?;
-            }
-            {
                 let q8a = self.q8bufs.get_mut(&cfg.ffn).unwrap();
-                self.gemv
-                    .quantize_q8(&self.stream, &self.act_dev, cfg.ffn, q8a, cfg.ffn, nb)?;
+                self.gemv.gelu_mul_q8(&self.stream, yd, q8a, cfg.ffn, nb)?;
             }
             {
                 let q8a = self.q8bufs.get(&cfg.ffn).unwrap();
@@ -977,12 +931,8 @@ impl Model {
                     gu_rows_e, HIDDEN, rbr, qo,
                 )?;
             }
-            self.gemv.gelu_mul_grouped(
-                &self.stream, &self.pair_y_gu, &mut self.pair_act, cfg.moe_inter, n_pairs,
-            )?;
-            self.gemv.quantize_q8(
-                &self.stream, &self.pair_act, cfg.moe_inter, &mut self.pair_act_q8,
-                cfg.moe_inter, n_pairs,
+            self.gemv.gelu_mul_q8(
+                &self.stream, &self.pair_y_gu, &mut self.pair_act_q8, cfg.moe_inter, n_pairs,
             )?;
             {
                 let (rbr, qo) = q4r_geom(cfg.moe_inter);
@@ -1429,13 +1379,8 @@ impl Model {
             }
             {
                 let yd = self.ybufs.get(&gu_rows).unwrap();
-                self.gemv
-                    .gelu_mul_grouped(&self.stream, yd, &mut self.act_dev, cfg.ffn, nb)?;
-            }
-            {
                 let q8a = self.q8bufs.get_mut(&cfg.ffn).unwrap();
-                self.gemv
-                    .quantize_q8(&self.stream, &self.act_dev, cfg.ffn, q8a, cfg.ffn, nb)?;
+                self.gemv.gelu_mul_q8(&self.stream, yd, q8a, cfg.ffn, nb)?;
             }
             {
                 let q8a = self.q8bufs.get(&cfg.ffn).unwrap();
@@ -1501,12 +1446,8 @@ impl Model {
                         gu_rows_e, HIDDEN, rbr, qo,
                     )?;
                 }
-                self.gemv.gelu_mul_grouped(
-                    &self.stream, &self.pair_y_gu, &mut self.pair_act, cfg.moe_inter, n_pairs,
-                )?;
-                self.gemv.quantize_q8(
-                    &self.stream, &self.pair_act, cfg.moe_inter, &mut self.pair_act_q8,
-                    cfg.moe_inter, n_pairs,
+                self.gemv.gelu_mul_q8(
+                    &self.stream, &self.pair_y_gu, &mut self.pair_act_q8, cfg.moe_inter, n_pairs,
                 )?;
                 {
                     let (rbr, qo) = q4r_geom(cfg.moe_inter);
@@ -1647,12 +1588,8 @@ impl Model {
                         gu_rows_e, HIDDEN, rbr, qo,
                     )?;
                 }
-                self.gemv.gelu_mul_grouped(
-                    &self.stream, &self.pair_y_gu, &mut self.pair_act, cfg.moe_inter, n_pairs,
-                )?;
-                self.gemv.quantize_q8(
-                    &self.stream, &self.pair_act, cfg.moe_inter, &mut self.pair_act_q8,
-                    cfg.moe_inter, n_pairs,
+                self.gemv.gelu_mul_q8(
+                    &self.stream, &self.pair_y_gu, &mut self.pair_act_q8, cfg.moe_inter, n_pairs,
                 )?;
                 {
                     let (rbr, qo) = q4r_geom(cfg.moe_inter);

@@ -89,6 +89,8 @@ pub struct Q4Gemv {
     kv_append: CudaFunction,
     attn_batch: CudaFunction,
     attn_chunk: CudaFunction,
+    qkv_prep: CudaFunction,
+    gelu_q8: CudaFunction,
     attn_merge: CudaFunction,
     dual_combine: CudaFunction,
     gemv_f32: CudaFunction,
@@ -131,6 +133,8 @@ impl Q4Gemv {
         let kv_append = module.load_function("kv_append")?;
         let attn_batch = module.load_function("attn_decode_batch")?;
         let attn_chunk = module.load_function("attn_decode_chunk")?;
+        let qkv_prep = module.load_function("qkv_prep")?;
+        let gelu_q8 = module.load_function("gelu_mul_q8")?;
         let attn_merge = module.load_function("attn_decode_merge")?;
         let dual_combine = module.load_function("dual_combine_rows")?;
         let gemv_f32 = module.load_function("gemv_f32_rows")?;
@@ -142,7 +146,7 @@ impl Q4Gemv {
         let promote = module.load_function("promote_experts")?;
         let q4r_idx = module.load_function("gemv_q4r_grouped_idx")?;
         let q4r_ptr = module.load_function("gemv_q4r_grouped_ptr")?;
-        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn, grouped_v3_idx, reduce_pairs, rmsnorm_rows, add_rows, rmsnorm_heads, rope_heads, kv_append, attn_batch, attn_chunk, attn_merge, dual_combine, gemv_f32, gather, grouped_v3_ptr, sample, topk, admit, promote, q4r_idx, q4r_ptr })
+        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn, grouped_v3_idx, reduce_pairs, rmsnorm_rows, add_rows, rmsnorm_heads, rope_heads, kv_append, attn_batch, attn_chunk, qkv_prep, gelu_q8, attn_merge, dual_combine, gemv_f32, gather, grouped_v3_ptr, sample, topk, admit, promote, q4r_idx, q4r_ptr })
     }
 
     /// One launch computing y[e] = W_e x_e for every routed expert of a layer.
@@ -346,6 +350,67 @@ impl Q4Gemv {
 
     /// batched decode attention over the pooled KV cache.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gelu_mul_q8(
+        &self,
+        stream: &Arc<CudaStream>,
+        gu: &CudaSlice<f32>,
+        q8: &mut CudaSlice<u8>,
+        inter: usize,
+        n: usize,
+    ) -> Result<()> {
+        assert_eq!(inter % 32, 0);
+        let nwarps = n * (inter / 32);
+        let (it, ne) = (inter as i32, n as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (nwarps.div_ceil(8) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.gelu_q8);
+        lb.arg(gu).arg(&mut *q8).arg(&it).arg(&ne);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    pub fn qkv_prep_dev(
+        &self,
+        stream: &Arc<CudaStream>,
+        y: &CudaSlice<f32>,
+        q_out: &mut CudaSlice<f32>,
+        kpool: &mut CudaSlice<u16>,
+        vpool: &mut CudaSlice<u16>,
+        q_norm: &CudaSlice<f32>,
+        k_norm: &CudaSlice<f32>,
+        inv_freq: &CudaSlice<f32>,
+        slot_arr: &CudaSlice<i32>,
+        pos_arr: &CudaSlice<i32>,
+        eps: f32,
+        hd: usize,
+        n_heads: usize,
+        kvh: usize,
+        qkv_rows: usize,
+        kv_dim: usize,
+        max_seq: usize,
+        n_seqs: usize,
+    ) -> Result<()> {
+        let (h, nh, kh, qr, kd, ms) = (
+            hd as i32, n_heads as i32, kvh as i32,
+            qkv_rows as i32, kv_dim as i32, max_seq as i32,
+        );
+        let cfg = LaunchConfig {
+            grid_dim: ((n_heads + 2 * kvh) as u32, n_seqs as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.qkv_prep);
+        lb.arg(y).arg(&mut *q_out).arg(&mut *kpool).arg(&mut *vpool)
+            .arg(q_norm).arg(k_norm).arg(inv_freq).arg(slot_arr).arg(pos_arr)
+            .arg(&eps).arg(&h).arg(&nh).arg(&kh).arg(&qr).arg(&kd).arg(&ms);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
     pub fn attn_decode_batch_dev(
         &self,
         stream: &Arc<CudaStream>,
