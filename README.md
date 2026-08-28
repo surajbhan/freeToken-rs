@@ -73,11 +73,25 @@ in-kernel over UVA by both pair GEMVs while blocking SMs.
 
 **GPU-poor hardware** (GTX 1650 4 GB laptop, driver 535): freeToken-rs runs the
 same 26B model at **8.9 tok/s** in hybrid mode (280-slot cache, CPU experts +
-PCIe streaming). Fetch-on-miss GPU routing manages only 5.2 tok/s there (7%
-expert coverage, PCIe 3 — misses dominate), confirming FreeToken's
-bandwidth-adaptive co-execution thesis on exactly the hardware it targets.
-Python FreeToken cannot start on this machine at all — its torch 2.11 pin is
-a CUDA-13 build requiring driver >= 580.
+PCIe streaming). llama.cpp with its equivalent recipe — dense/attention on the
+GPU, all experts on CPU (`-ngl 99 -ncmoe 30 -fa on`, offload verified: 1.5 GB
+dense weights in VRAM) — sustains **4.5–6.2 tok/s** on the same 400-token
+generation. The gap is the expert cache: llama.cpp recomputes every expert on
+the CPU every token, while freeToken-rs keeps the 280 hottest expert banks in
+spare VRAM (39% hit rate) and splits the misses between PCIe fetch and CPU
+compute at the calibrated q\* ratio. Fetch-on-miss GPU routing alone manages
+only 5.2 tok/s (7% expert coverage, PCIe 3 — misses dominate), confirming
+FreeToken's bandwidth-adaptive co-execution thesis on exactly the hardware it
+targets. Python FreeToken cannot start on this machine at all — its torch 2.11
+pin is a CUDA-13 build requiring driver >= 580.
+
+**Unified memory (Apple M4 Pro mac mini, 64 GB)**: llama.cpp running
+*CPU-only* does **32.8 tok/s** on the same model — ~4x the best any engine
+achieves on the 4 GB discrete GPU. On Apple Silicon every compute unit reads
+the full model at memory bandwidth, so the problem this engine exists to
+manage (experts stranded behind a PCIe link) does not arise; an expert cache
+would cache into the same memory it fetches from. (Metal full-offload was not
+measurable on this particular box — a Docker VM had 43 GB wired.)
 
 ## Concurrency
 
