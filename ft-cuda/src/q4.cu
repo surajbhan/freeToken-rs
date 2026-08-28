@@ -190,3 +190,88 @@ extern "C" __global__ void reduce_weighted(const float* __restrict__ y,
         out[i] += a * s;
     }
 }
+
+// ---- kernels for the full model forward (ft-model) ----
+
+// GGUF q6_k GEMV: 256 elems / 210-byte block: ql[128] low-4, qh[64] hi-2,
+// scales[16] i8 per 16 elems, then f16 d. value = d * sc * (q - 32).
+// One warp per row, 4 rows per block (matches v2's shape; x staged in smem).
+extern "C" __global__ void gemv_q6_k(
+    const unsigned char* __restrict__ w, // [n_rows, k/256*210]
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int n_rows,
+    int k)
+{
+    extern __shared__ float xs[];
+    for (int i = threadIdx.x; i < k; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row = blockIdx.x * 4 + warp;
+    if (row >= n_rows) return;
+    int nblocks = k / 256;
+    const unsigned char* wr = w + (size_t)row * nblocks * 210;
+
+    float acc = 0.0f;
+    for (int b = lane; b < nblocks; b += 32) {
+        const unsigned char* blk = wr + b * 210;
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+        const signed char* sc = reinterpret_cast<const signed char*>(blk + 192);
+        float d = __half2float(*reinterpret_cast<const __half*>(blk + 208));
+        const float* xb = xs + b * 256;
+        float s = 0.0f;
+        // ggml q6_K layout: two 128-elem halves; within each half n (0..64)
+        // pairs with n+64 sharing a ql byte, qh packs 4 x 2 bits.
+        for (int half = 0; half < 2; ++half) {
+            const unsigned char* qlh = ql + half * 64;
+            const unsigned char* qhh = qh + half * 32;
+            const float* xh = xb + half * 128;
+            const signed char* sch = sc + half * 8;
+            for (int i = 0; i < 32; ++i) {
+                int q1 = (qlh[i] & 0xF) | (((qhh[i] >> 0) & 3) << 4);
+                int q2 = (qlh[i + 32] & 0xF) | (((qhh[i] >> 2) & 3) << 4);
+                int q3 = (qlh[i] >> 4) | (((qhh[i] >> 4) & 3) << 4);
+                int q4 = (qlh[i + 32] >> 4) | (((qhh[i] >> 6) & 3) << 4);
+                s += (float)sch[i / 16 + 0] * (q1 - 32) * xh[i]
+                   + (float)sch[i / 16 + 2] * (q2 - 32) * xh[i + 32]
+                   + (float)sch[i / 16 + 4] * (q3 - 32) * xh[i + 64]
+                   + (float)sch[i / 16 + 6] * (q4 - 32) * xh[i + 96];
+            }
+        }
+        acc += d * s;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    if (lane == 0) y[row] = acc;
+}
+
+// out[e][j] = gelu_tanh(gu[e][j]) * gu[e][inter + j] — gemma's expert/MLP
+// activation (gelu_pytorch_tanh), grouped over experts.
+extern "C" __global__ void gelu_mul_grouped(const float* __restrict__ gu,
+                                            float* __restrict__ out,
+                                            int inter, int n_experts)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_experts * inter) {
+        int e = i / inter, j = i % inter;
+        float g = gu[(size_t)e * 2 * inter + j];
+        float t = tanhf(0.7978845608f * (g + 0.044715f * g * g * g));
+        out[i] = 0.5f * g * (1.0f + t) * gu[(size_t)e * 2 * inter + inter + j];
+    }
+}
+
+// out[i] += sum_e wts[e] * y[e][i] — router-weighted expert combine.
+extern "C" __global__ void reduce_expert_weighted(const float* __restrict__ y,
+                                                  const float* __restrict__ wts,
+                                                  float* __restrict__ out,
+                                                  int hidden, int n_experts)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < hidden) {
+        float s = 0.0f;
+        for (int e = 0; e < n_experts; ++e) s += wts[e] * y[(size_t)e * hidden + i];
+        out[i] += s;
+    }
+}

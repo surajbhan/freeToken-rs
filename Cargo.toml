@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ft-core", "ft-bench", "ft-cuda", "ft-gguf"]
+members = ["ft-core", "ft-bench", "ft-cuda", "ft-gguf", "ft-model"]
 
 [workspace.dependencies]
 cudarc = { version = "0.19", features = ["cuda-12000"] }

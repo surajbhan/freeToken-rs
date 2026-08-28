@@ -55,6 +55,9 @@ pub struct Q4Gemv {
     grouped: CudaFunction,
     silu_grouped: CudaFunction,
     reduce: CudaFunction,
+    q6k: CudaFunction,
+    gelu_grouped: CudaFunction,
+    reduce_ew: CudaFunction,
 }
 
 impl Q4Gemv {
@@ -67,7 +70,10 @@ impl Q4Gemv {
         let grouped = module.load_function("gemv_q4_0_grouped_v2")?;
         let silu_grouped = module.load_function("silu_mul_grouped")?;
         let reduce = module.load_function("reduce_weighted")?;
-        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce })
+        let q6k = module.load_function("gemv_q6_k")?;
+        let gelu_grouped = module.load_function("gelu_mul_grouped")?;
+        let reduce_ew = module.load_function("reduce_expert_weighted")?;
+        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew })
     }
 
     /// One launch computing y[e] = W_e x_e for every routed expert of a layer.
@@ -102,6 +108,74 @@ impl Q4Gemv {
         };
         let mut lb = stream.launch_builder(&self.grouped);
         lb.arg(cache).arg(&eb).arg(&off).arg(slots).arg(x).arg(&xs).arg(y).arg(&ys).arg(&nr).arg(&ki);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// y = W x for a q6_k matrix (n_rows, k) — the tied lm_head. Smem = k floats.
+    pub fn gemv_q6k(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: &CudaSlice<u8>,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        n_rows: usize,
+        k: usize,
+    ) -> Result<()> {
+        assert_eq!(k % 256, 0);
+        assert_eq!(w.len(), n_rows * (k / 256) * 210);
+        let (nr, ki) = (n_rows as i32, k as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows.div_ceil(4) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: (k * 4) as u32,
+        };
+        let mut lb = stream.launch_builder(&self.q6k);
+        lb.arg(w).arg(x).arg(y).arg(&nr).arg(&ki);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// out[e] = gelu_tanh(gate) * up for all experts in one launch (gemma).
+    pub fn gelu_mul_grouped(
+        &self,
+        stream: &Arc<CudaStream>,
+        gu: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        inter: usize,
+        n_experts: usize,
+    ) -> Result<()> {
+        let (ni, ne) = (inter as i32, n_experts as i32);
+        let total = inter * n_experts;
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.gelu_grouped);
+        lb.arg(gu).arg(out).arg(&ni).arg(&ne);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// out += sum_e wts[e] * y[e] — router-weighted combine.
+    pub fn reduce_expert_weighted(
+        &self,
+        stream: &Arc<CudaStream>,
+        y: &CudaSlice<f32>,
+        wts: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        hidden: usize,
+        n_experts: usize,
+    ) -> Result<()> {
+        let (h, ne) = (hidden as i32, n_experts as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (hidden.div_ceil(256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.reduce_ew);
+        lb.arg(y).arg(wts).arg(out).arg(&h).arg(&ne);
         unsafe { lb.launch(cfg)? };
         Ok(())
     }

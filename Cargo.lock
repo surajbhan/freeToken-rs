@@ -101,6 +101,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ft-model"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "ft-core",
+ "ft-cuda",
+ "ft-gguf",
+ "half",
+ "rayon",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

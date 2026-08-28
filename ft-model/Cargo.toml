@@ -1,0 +1,13 @@
+[package]
+name = "ft-model"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ft-core = { path = "../ft-core" }
+ft-cuda = { path = "../ft-cuda" }
+ft-gguf = { path = "../ft-gguf" }
+cudarc.workspace = true
+rayon.workspace = true
+half.workspace = true
+anyhow.workspace = true
