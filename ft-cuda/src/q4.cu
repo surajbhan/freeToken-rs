@@ -545,6 +545,148 @@ extern "C" __global__ void gemv_q6_k_q8(
 
 // batched decode attention over the pooled KV cache: grid (n_heads, n_seqs);
 // per-seq slot/pos/kv_start arrays. q/out are [n_seqs, n_heads*hd].
+// Flash-decode: position chunks fan out over blocks so short-context decode
+// still fills the GPU. Each block reduces one (head, chunk) to an
+// online-softmax partial (m, l, unnormalized acc); a small merge kernel
+// combines the chunks per head.
+#define ATTN_CHUNK 128
+
+extern "C" __global__ void attn_decode_chunk(
+    const unsigned short* __restrict__ kpool, // [max_batch, max_seq, kv_dim] f16 bits
+    const unsigned short* __restrict__ vpool,
+    const float* __restrict__ q,
+    float* __restrict__ partials,   // [nb, n_heads, max_chunks, hd+2]
+    const int* __restrict__ slot_arr,
+    const int* __restrict__ pos_arr,
+    int window,
+    int kv_dim,
+    int hd,
+    int group,
+    int n_heads,
+    int max_seq,
+    int max_chunks)
+{
+    __shared__ float sc[ATTN_CHUNK];
+    __shared__ float red[128];
+    __shared__ float warp_out[4 * 512];
+    int h = blockIdx.x;
+    int c = blockIdx.y;
+    int s = blockIdx.z;
+    int kv_end = pos_arr[s] + 1;
+    int kv_start = (window > 0 && kv_end > window) ? kv_end - window : 0;
+    int n = kv_end - kv_start;
+    int i0 = c * ATTN_CHUNK;
+    if (i0 >= n) return;
+    int cn = min(ATTN_CHUNK, n - i0);
+    int g = h / group;
+    const float* qh = q + (size_t)s * n_heads * hd + (size_t)h * hd;
+    const __half* kc = reinterpret_cast<const __half*>(kpool)
+                     + (size_t)slot_arr[s] * max_seq * kv_dim
+                     + (size_t)(kv_start + i0) * kv_dim + (size_t)g * hd;
+    const __half* vc = reinterpret_cast<const __half*>(vpool)
+                     + (size_t)slot_arr[s] * max_seq * kv_dim
+                     + (size_t)(kv_start + i0) * kv_dim + (size_t)g * hd;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int dpl = hd >> 5;
+
+    // scores: warp per position, lanes over d (coalesced K reads)
+    for (int i = warp; i < cn; i += 4) {
+        const __half* kt = kc + (size_t)i * kv_dim;
+        float sv = 0.0f;
+        for (int kdi = 0; kdi < dpl; ++kdi) {
+            int d = lane + (kdi << 5);
+            sv += qh[d] * __half2float(kt[d]);
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            sv += __shfl_down_sync(0xFFFFFFFFu, sv, off);
+        if (lane == 0) sc[i] = sv;
+    }
+    __syncthreads();
+
+    // chunk-local softmax numerators: m = max, sc[i] = exp(sc[i]-m), l = sum
+    float m = -1e30f;
+    for (int i = threadIdx.x; i < cn; i += blockDim.x) m = fmaxf(m, sc[i]);
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s2]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < cn; i += blockDim.x) {
+        float e2 = __expf(sc[i] - m);
+        sc[i] = e2;
+        sum += e2;
+    }
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] += red[threadIdx.x + s2];
+        __syncthreads();
+    }
+    float l = red[0];
+    __syncthreads();
+
+    // unnormalized weighted V accumulation
+    float acc[16];
+#pragma unroll
+    for (int kdi = 0; kdi < 16; ++kdi) acc[kdi] = 0.0f;
+    for (int i = warp; i < cn; i += 4) {
+        float w = sc[i];
+        const __half* vt = vc + (size_t)i * kv_dim;
+        for (int kdi = 0; kdi < dpl; ++kdi) {
+            int d = lane + (kdi << 5);
+            acc[kdi] += w * __half2float(vt[d]);
+        }
+    }
+    for (int kdi = 0; kdi < dpl; ++kdi)
+        warp_out[warp * hd + lane + (kdi << 5)] = acc[kdi];
+    __syncthreads();
+    float* pp = partials
+        + ((size_t)(s * n_heads + h) * max_chunks + c) * (size_t)(hd + 2);
+    if (threadIdx.x == 0) { pp[0] = m; pp[1] = l; }
+    for (int d = threadIdx.x; d < hd; d += blockDim.x)
+        pp[2 + d] = warp_out[d] + warp_out[hd + d] + warp_out[2 * hd + d]
+                  + warp_out[3 * hd + d];
+}
+
+extern "C" __global__ void attn_decode_merge(
+    const float* __restrict__ partials,
+    float* __restrict__ out,
+    const int* __restrict__ pos_arr,
+    int window,
+    int hd,
+    int n_heads,
+    int max_chunks)
+{
+    int h = blockIdx.x;
+    int s = blockIdx.y;
+    int kv_end = pos_arr[s] + 1;
+    int kv_start = (window > 0 && kv_end > window) ? kv_end - window : 0;
+    int n = kv_end - kv_start;
+    int nc = (n + ATTN_CHUNK - 1) / ATTN_CHUNK;
+    const float* base = partials
+        + (size_t)(s * n_heads + h) * max_chunks * (size_t)(hd + 2);
+    size_t stride = hd + 2;
+    // nc <= 16: every thread redundantly folds the chunk stats (cheap)
+    float M = -1e30f;
+    for (int c = 0; c < nc; ++c) M = fmaxf(M, base[c * stride]);
+    float L = 0.0f;
+    for (int c = 0; c < nc; ++c)
+        L += __expf(base[c * stride] - M) * base[c * stride + 1];
+    float inv = 1.0f / L;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float o = 0.0f;
+        for (int c = 0; c < nc; ++c)
+            o += __expf(base[c * stride] - M) * base[c * stride + 2 + d];
+        out[(size_t)(s * n_heads + h) * hd + d] = o * inv;
+    }
+}
+
 extern "C" __global__ void attn_decode_batch(
     const unsigned short* __restrict__ kpool, // [max_batch, max_seq, kv_dim] f16 bits
     const unsigned short* __restrict__ vpool,
@@ -559,7 +701,13 @@ extern "C" __global__ void attn_decode_batch(
     int n_heads,
     int max_seq)
 {
-    extern __shared__ float sc[];
+    // Coalescing-aware decode attention: warps own position chunks, lanes
+    // sweep the head dim, so every K/V access is a coalesced 64B warp read.
+    // out accumulates in registers (hd/32 <= 16 per lane), cross-warp reduced
+    // through shared memory at the end.
+    extern __shared__ float sc[];          // scores [n]
+    __shared__ float red[128];
+    __shared__ float warp_out[4 * 512];    // per-warp partial out (hd <= 512)
     int h = blockIdx.x;
     int s = blockIdx.y;
     int g = h / group;
@@ -571,15 +719,26 @@ extern "C" __global__ void attn_decode_batch(
                      + (size_t)slot_arr[s] * max_seq * kv_dim;
     const __half* vc = reinterpret_cast<const __half*>(vpool)
                      + (size_t)slot_arr[s] * max_seq * kv_dim;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int dpl = hd >> 5; // dims per lane
 
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    // pass 1: scores — warp per position, lanes over d (coalesced K reads)
+    for (int i = warp; i < n; i += 4) {
         const __half* kt = kc + (size_t)(kv_start + i) * kv_dim + (size_t)g * hd;
         float sv = 0.0f;
-        for (int d = 0; d < hd; ++d) sv += qh[d] * __half2float(kt[d]);
-        sc[i] = sv;
+        for (int kdi = 0; kdi < dpl; ++kdi) {
+            int d = lane + (kdi << 5);
+            sv += qh[d] * __half2float(kt[d]);
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            sv += __shfl_down_sync(0xFFFFFFFFu, sv, off);
+        if (lane == 0) sc[i] = sv;
     }
     __syncthreads();
-    __shared__ float red[128];
+
+    // softmax over sc[0..n]
     float m = -1e30f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, sc[i]);
     red[threadIdx.x] = m;
@@ -604,12 +763,26 @@ extern "C" __global__ void attn_decode_batch(
     }
     float inv = 1.0f / red[0];
     __syncthreads();
+
+    // pass 2: warp per position chunk, lanes over d, register accumulation
+    float acc[16];
+#pragma unroll
+    for (int kdi = 0; kdi < 16; ++kdi) acc[kdi] = 0.0f;
+    for (int i = warp; i < n; i += 4) {
+        float w = sc[i];
+        const __half* vt = vc + (size_t)(kv_start + i) * kv_dim + (size_t)g * hd;
+        for (int kdi = 0; kdi < dpl; ++kdi) {
+            int d = lane + (kdi << 5);
+            acc[kdi] += w * __half2float(vt[d]);
+        }
+    }
+    for (int kdi = 0; kdi < dpl; ++kdi)
+        warp_out[warp * hd + lane + (kdi << 5)] = acc[kdi];
+    __syncthreads();
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
-        float acc = 0.0f;
-        const __half* v0 = vc + (size_t)kv_start * kv_dim + (size_t)g * hd + d;
-        for (int i = 0; i < n; ++i)
-            acc += sc[i] * __half2float(v0[(size_t)i * kv_dim]);
-        out[(size_t)s * n_heads * hd + (size_t)h * hd + d] = acc * inv;
+        float o = warp_out[d] + warp_out[hd + d] + warp_out[2 * hd + d]
+                + warp_out[3 * hd + d];
+        out[(size_t)s * n_heads * hd + (size_t)h * hd + d] = o * inv;
     }
 }
 
@@ -1131,7 +1304,9 @@ extern "C" __global__ void lru_admit(
                 map[key] = victim;
                 unsigned int c = ++clock_ctr[0];
                 slot_last[victim] = c;
-                bases[t] = banks_base + (unsigned long long)key * expert_bytes;
+                // two-phase: gemv reads the slot (DRAM) after the promote
+                // copy lands, instead of re-reading the host bank over PCIe
+                bases[t] = cache_base + (unsigned long long)victim * expert_bytes;
                 promote_src_key[t] = key;
                 promote_dst_slot[t] = victim;
             }
@@ -1153,11 +1328,11 @@ extern "C" __global__ void promote_experts(
     int t = blockIdx.y;
     int key = promote_src_key[t];
     if (key < 0) return;
-    const unsigned int* src = reinterpret_cast<const unsigned int*>(
+    const uint4* src = reinterpret_cast<const uint4*>(
         banks_base + (unsigned long long)key * expert_bytes);
-    unsigned int* dst = reinterpret_cast<unsigned int*>(
+    uint4* dst = reinterpret_cast<uint4*>(
         cache_base + (unsigned long long)promote_dst_slot[t] * expert_bytes);
-    size_t n = expert_bytes / 4;
+    size_t n = expert_bytes / 16;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          i < n;
          i += (size_t)gridDim.x * blockDim.x)

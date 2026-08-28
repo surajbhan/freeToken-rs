@@ -88,6 +88,8 @@ pub struct Q4Gemv {
     rope_heads: CudaFunction,
     kv_append: CudaFunction,
     attn_batch: CudaFunction,
+    attn_chunk: CudaFunction,
+    attn_merge: CudaFunction,
     dual_combine: CudaFunction,
     gemv_f32: CudaFunction,
     gather: CudaFunction,
@@ -128,6 +130,8 @@ impl Q4Gemv {
         let rope_heads = module.load_function("rope_heads")?;
         let kv_append = module.load_function("kv_append")?;
         let attn_batch = module.load_function("attn_decode_batch")?;
+        let attn_chunk = module.load_function("attn_decode_chunk")?;
+        let attn_merge = module.load_function("attn_decode_merge")?;
         let dual_combine = module.load_function("dual_combine_rows")?;
         let gemv_f32 = module.load_function("gemv_f32_rows")?;
         let gather = module.load_function("gather_rows")?;
@@ -138,7 +142,7 @@ impl Q4Gemv {
         let promote = module.load_function("promote_experts")?;
         let q4r_idx = module.load_function("gemv_q4r_grouped_idx")?;
         let q4r_ptr = module.load_function("gemv_q4r_grouped_ptr")?;
-        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn, grouped_v3_idx, reduce_pairs, rmsnorm_rows, add_rows, rmsnorm_heads, rope_heads, kv_append, attn_batch, dual_combine, gemv_f32, gather, grouped_v3_ptr, sample, topk, admit, promote, q4r_idx, q4r_ptr })
+        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn, grouped_v3_idx, reduce_pairs, rmsnorm_rows, add_rows, rmsnorm_heads, rope_heads, kv_append, attn_batch, attn_chunk, attn_merge, dual_combine, gemv_f32, gather, grouped_v3_ptr, sample, topk, admit, promote, q4r_idx, q4r_ptr })
     }
 
     /// One launch computing y[e] = W_e x_e for every routed expert of a layer.
@@ -348,6 +352,7 @@ impl Q4Gemv {
         kpool: &CudaSlice<u16>,
         vpool: &CudaSlice<u16>,
         q: &CudaSlice<f32>,
+        partials: &mut CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
         slot_arr: &CudaSlice<i32>,
         pos_arr: &CudaSlice<i32>,
@@ -360,25 +365,40 @@ impl Q4Gemv {
         n_seqs: usize,
         max_ctx: usize,
     ) -> Result<()> {
-        let smem = max_ctx * 4;
-        assert!(smem <= 48 * 1024);
-        let (w, kd, h, g, nh, ms) = (
+        const CHUNK: usize = 128;
+        // partials layout is [nb, n_heads, max_chunks, hd+2] with max_chunks
+        // derived from the full pool depth so the merge kernel agrees
+        let max_chunks = max_seq.div_ceil(CHUNK);
+        // graph-stable launch bound: a layer's reachable context
+        let reach = if window > 0 { window.min(max_ctx) } else { max_ctx };
+        let launch_chunks = reach.div_ceil(CHUNK);
+        let (w, kd, h, g, nh, ms, mc) = (
             window as i32,
             kv_dim as i32,
             hd as i32,
             group as i32,
             n_heads as i32,
             max_seq as i32,
+            max_chunks as i32,
         );
         let cfg = LaunchConfig {
+            grid_dim: (n_heads as u32, launch_chunks as u32, n_seqs as u32),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut lb = stream.launch_builder(&self.attn_chunk);
+        lb.arg(kpool).arg(vpool).arg(q).arg(&mut *partials).arg(slot_arr).arg(pos_arr)
+            .arg(&w).arg(&kd).arg(&h).arg(&g).arg(&nh).arg(&ms).arg(&mc);
+        unsafe { lb.launch(cfg)? };
+        let cfg2 = LaunchConfig {
             grid_dim: (n_heads as u32, n_seqs as u32, 1),
             block_dim: (128, 1, 1),
-            shared_mem_bytes: smem as u32,
+            shared_mem_bytes: 0,
         };
-        let mut lb = stream.launch_builder(&self.attn_batch);
-        lb.arg(kpool).arg(vpool).arg(q).arg(out).arg(slot_arr).arg(pos_arr)
-            .arg(&w).arg(&kd).arg(&h).arg(&g).arg(&nh).arg(&ms);
-        unsafe { lb.launch(cfg)? };
+        let mut lb2 = stream.launch_builder(&self.attn_merge);
+        lb2.arg(&*partials).arg(&mut *out).arg(pos_arr)
+            .arg(&w).arg(&h).arg(&nh).arg(&mc);
+        unsafe { lb2.launch(cfg2)? };
         Ok(())
     }
 

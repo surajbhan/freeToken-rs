@@ -325,6 +325,7 @@ pub struct Model {
     router_logits_dev: CudaSlice<f32>,
     sc_a: CudaSlice<f32>,
     sc_o: CudaSlice<f32>,
+    attn_partials: CudaSlice<f32>,
     sc_pf: CudaSlice<f32>,
     sc_ri: CudaSlice<f32>,
     final_norm_d: CudaSlice<f32>,
@@ -658,6 +659,9 @@ impl Model {
             router_logits_dev: stream.alloc_zeros::<f32>(max_batch * cfg.n_experts)?,
             sc_a: stream.alloc_zeros::<f32>(max_batch * HIDDEN)?,
             sc_o: stream.alloc_zeros::<f32>(max_batch * cfg.n_heads * cfg.head_dim_full)?,
+            attn_partials: stream.alloc_zeros::<f32>(
+                max_batch * cfg.n_heads * cfg.max_seq.div_ceil(128) * (cfg.head_dim_full + 2),
+            )?,
             sc_pf: stream.alloc_zeros::<f32>(max_batch * HIDDEN)?,
             sc_ri: stream.alloc_zeros::<f32>(max_batch * HIDDEN)?,
             final_norm_d: stream.memcpy_stod(&final_norm)?,
@@ -766,6 +770,10 @@ impl Model {
     fn enqueue_stack(&mut self, nb: usize) -> Result<()> {
         let cfg = self.cfg.clone();
         anyhow::ensure!(self.gpu_routing, "enqueue_stack requires gpu_routing");
+        let skip_moe = std::env::var("FT_SKIP_MOE").is_ok();
+        let skip_attn = std::env::var("FT_SKIP_ATTN").is_ok();
+        let skip_dense = std::env::var("FT_SKIP_DENSE").is_ok();
+        let skip_lmhead = std::env::var("FT_SKIP_LMHEAD").is_ok();
         for l in 0..cfg.n_layers {
             let hd = cfg.head_dim(l);
             let kvh = cfg.kv_heads[l];
@@ -785,13 +793,13 @@ impl Model {
             {
                 let q8 = self.q8bufs.get(&HIDDEN).unwrap();
                 let yd = self.ybufs.get_mut(&qkv_rows).unwrap();
-                {
+                if !skip_dense { {
                     let (rbr, qo) = q4r_geom(HIDDEN);
                     self.gemv.gemv_q4r_idx(
                         &self.stream, &self.layers[l].qkv, 0, 0, &self.zeros_b, &self.dense_idx,
                         nb, q8, HIDDEN / 32, yd, qkv_rows, qkv_rows, HIDDEN, rbr, qo,
                     )?;
-                }
+                } }
             }
             {
                 let yd = self.ybufs.get_mut(&qkv_rows).unwrap();
@@ -845,13 +853,15 @@ impl Model {
                 self.gemv
                     .gather_rows_dev(&self.stream, yd, &mut self.attn_out_dev, qkv_rows, 0, q_rows, nb)?;
             }
-            self.gemv.attn_decode_batch_dev(
-                &self.stream, &self.k_pool[l], &self.v_pool[l], &self.attn_out_dev,
-                &mut self.sc_o, &self.slot_dev, &self.pos_dev,
-                if cfg.swa[l] { cfg.window } else { 0 },
-                kv_dim, hd, group, cfg.n_heads, cfg.max_seq, nb,
-                cfg.max_seq, // fixed smem for graph stability
-            )?;
+            if !skip_attn {
+                self.gemv.attn_decode_batch_dev(
+                    &self.stream, &self.k_pool[l], &self.v_pool[l], &self.attn_out_dev,
+                    &mut self.attn_partials, &mut self.sc_o, &self.slot_dev, &self.pos_dev,
+                    if cfg.swa[l] { cfg.window } else { 0 },
+                    kv_dim, hd, group, cfg.n_heads, cfg.max_seq, nb,
+                    cfg.max_seq,
+                )?;
+            }
             {
                 let q8 = self.q8bufs.get_mut(&q_rows).unwrap();
                 self.gemv
@@ -860,13 +870,13 @@ impl Model {
             {
                 let q8 = self.q8bufs.get(&q_rows).unwrap();
                 let yd = self.ybufs.get_mut(&HIDDEN).unwrap();
-                {
+                if !skip_dense { {
                     let (rbr, qo) = q4r_geom(q_rows);
                     self.gemv.gemv_q4r_idx(
                         &self.stream, &self.layers[l].o, 0, 0, &self.zeros_b, &self.dense_idx,
                         nb, q8, q_rows / 32, yd, HIDDEN, HIDDEN, q_rows, rbr, qo,
                     )?;
-                }
+                } }
             }
             {
                 let yd = self.ybufs.get(&HIDDEN).unwrap();
@@ -891,13 +901,13 @@ impl Model {
                 .quantize_q8(&self.stream, &self.sc_pf, HIDDEN, &mut self.q8_preff, HIDDEN, nb)?;
             {
                 let yd = self.ybufs.get_mut(&gu_rows).unwrap();
-                {
+                if !skip_dense { {
                     let (rbr, qo) = q4r_geom(HIDDEN);
                     self.gemv.gemv_q4r_idx(
                         &self.stream, &self.layers[l].gate_up, 0, 0, &self.zeros_b, &self.dense_idx,
                         nb, &self.q8_preff, HIDDEN / 32, yd, gu_rows, gu_rows, HIDDEN, rbr, qo,
                     )?;
-                }
+                } }
             }
             {
                 let yd = self.ybufs.get(&gu_rows).unwrap();
@@ -912,13 +922,13 @@ impl Model {
             {
                 let q8a = self.q8bufs.get(&cfg.ffn).unwrap();
                 let yd = self.ybufs.get_mut(&HIDDEN).unwrap();
-                {
+                if !skip_dense { {
                     let (rbr, qo) = q4r_geom(cfg.ffn);
                     self.gemv.gemv_q4r_idx(
                         &self.stream, &self.layers[l].down, 0, 0, &self.zeros_b, &self.dense_idx,
                         nb, q8a, cfg.ffn / 32, yd, HIDDEN, HIDDEN, cfg.ffn, rbr, qo,
                     )?;
-                }
+                } }
             }
             self.gemv
                 .rmsnorm_rows_dev(&self.stream, &self.x_res, None, &mut self.sc_a, HIDDEN, cfg.eps, nb)?;
@@ -946,13 +956,18 @@ impl Model {
                 &self.copy_stream, &self.promote_src_dev, &self.promote_dst_dev,
                 self.banks_dptr, self.cache_dptr, self.moe.eb, nb * cfg.topk,
             )?;
-            self.pending_fetch = Some(self.copy_stream.record_event(None)?);
+            // two-phase: pair gemvs read misses from their freshly-promoted
+            // slots, so the fetch must land before they launch
+            let ev_f = self.copy_stream.record_event(None)?;
+            self.stream.wait(&ev_f)?;
+            self.captured_events.push(ev_f);
 
             let n_pairs = nb * cfg.topk;
             {
                 let mut r = self.routed_out_dev.slice_mut(0..nb * HIDDEN);
                 self.stream.memset_zeros(&mut r)?;
             }
+            if !skip_moe {
             let gu_rows_e = 2 * cfg.moe_inter;
             {
                 let (rbr, qo) = q4r_geom(HIDDEN);
@@ -981,6 +996,7 @@ impl Model {
                 &self.stream, &self.pair_y_down, &self.pair_wts, &self.pair_seq,
                 &mut self.routed_out_dev, HIDDEN, n_pairs, nb,
             )?;
+            }
             {
                 let sh2 = self.ybufs.get(&HIDDEN).unwrap();
                 self.gemv.dual_combine_dev(
@@ -1004,14 +1020,14 @@ impl Model {
         )?;
         self.gemv
             .quantize_q8(&self.stream, &self.sc_a, HIDDEN, &mut self.q8_preff, HIDDEN, nb)?;
-        {
+        if !skip_lmhead { {
             let (rbr, qo) = q4r_geom(HIDDEN);
             self.gemv.gemv_q4r_idx(
                 &self.stream, &self.lm_head_q4, 0, 0, &self.zeros_b, &self.dense_idx,
                 nb, &self.q8_preff, HIDDEN / 32, &mut self.logits_dev, cfg.vocab,
                 cfg.vocab, HIDDEN, rbr, qo,
             )?;
-        }
+        } }
         self.gemv.sample_tokens_dev(
             &self.stream, &self.logits_dev, &self.temps_dev, &mut self.rng_dev,
             &mut self.tok_out_dev, cfg.vocab, cfg.softcap, nb,
@@ -1351,7 +1367,7 @@ impl Model {
             }
             self.gemv.attn_decode_batch_dev(
                 &self.stream, &self.k_pool[l], &self.v_pool[l], &self.attn_out_dev,
-                &mut self.sc_o, &self.slot_dev, &self.pos_dev,
+                &mut self.attn_partials, &mut self.sc_o, &self.slot_dev, &self.pos_dev,
                 if cfg.swa[l] { cfg.window } else { 0 },
                 kv_dim, hd, group, cfg.n_heads, cfg.max_seq, nb, max_pos + 1,
             )?;
@@ -1466,7 +1482,9 @@ impl Model {
                     &self.copy_stream, &self.promote_src_dev, &self.promote_dst_dev,
                     self.banks_dptr, self.cache_dptr, self.moe.eb, nb * cfg.topk,
                 )?;
-                self.pending_fetch = Some(self.copy_stream.record_event(None)?);
+                // two-phase: misses are read from slots, so the fetch must land first
+                let ev_f = self.copy_stream.record_event(None)?;
+                self.stream.wait(&ev_f)?;
                 lap!(embed_us); // reused: admit+promote cost bucket
 
                 let n_pairs = nb * cfg.topk;
