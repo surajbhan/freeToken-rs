@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="300" viewBox="0 0 760 300" role="img" aria-label="Gemma-4-26B-A4B decode — RTX 4060 Ti 16 GB">
+<rect width="760" height="300" fill="#0d1117"/>
+<text x="24" y="32" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="16" font-weight="600" fill="#e6edf3">Gemma-4-26B-A4B decode — RTX 4060 Ti 16 GB</text>
+<text x="24" y="52" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#8b949e">single-stream decode throughput, QAT q4_0, 400-token generation, all experts GPU-cached</text>
+<line x1="262.0" y1="70" x2="262.0" y2="260" stroke="#2a313c" stroke-width="1"/>
+<text x="262.0" y="276" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#8b949e" text-anchor="middle" style="font-variant-numeric:tabular-nums">0</text>
+<line x1="372.0" y1="70" x2="372.0" y2="260" stroke="#2a313c" stroke-width="1"/>
+<text x="372.0" y="276" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#8b949e" text-anchor="middle" style="font-variant-numeric:tabular-nums">25</text>
+<line x1="482.0" y1="70" x2="482.0" y2="260" stroke="#2a313c" stroke-width="1"/>
+<text x="482.0" y="276" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#8b949e" text-anchor="middle" style="font-variant-numeric:tabular-nums">50</text>
+<line x1="592.0" y1="70" x2="592.0" y2="260" stroke="#2a313c" stroke-width="1"/>
+<text x="592.0" y="276" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#8b949e" text-anchor="middle" style="font-variant-numeric:tabular-nums">75</text>
+<line x1="702.0" y1="70" x2="702.0" y2="260" stroke="#2a313c" stroke-width="1"/>
+<text x="702.0" y="276" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#8b949e" text-anchor="middle" style="font-variant-numeric:tabular-nums">100</text>
+<text x="702" y="292" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#8b949e" text-anchor="end">tokens / second</text>
+<line x1="262" y1="70" x2="262" y2="260" stroke="#3d4550" stroke-width="1"/>
+<text x="248" y="87" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12.5" fill="#e6edf3" text-anchor="end">Python FreeToken</text>
+<text x="248" y="102" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#8b949e" text-anchor="end">native accel (flashinfer, driver 580)</text>
+<path d="M263,78 h399.92 a4,4 0 0 1 4,4 v16 a4,4 0 0 1 -4,4 h-399.92 Z" fill="#4E80BE" fill-opacity="1.0"/>
+<text x="674.9" y="94" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12.5" font-weight="600" fill="#e6edf3" style="font-variant-numeric:tabular-nums">91.8</text>
+<text x="248" y="131" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12.5" fill="#e6edf3" text-anchor="end">freeToken-rs</text>
+<text x="248" y="146" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#8b949e" text-anchor="end">current (graphs + flash-decode + fused kernels)</text>
+<path d="M263,122 h330.84 a4,4 0 0 1 4,4 v16 a4,4 0 0 1 -4,4 h-330.84 Z" fill="#C96A38" fill-opacity="1.0"/>
+<text x="605.8" y="138" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12.5" font-weight="600" fill="#e6edf3" style="font-variant-numeric:tabular-nums">76.1</text>
+<text x="248" y="175" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12.5" fill="#e6edf3" text-anchor="end">Python FreeToken</text>
+<text x="248" y="190" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#8b949e" text-anchor="end">Triton fallback (driver 550)</text>
+<path d="M263,166 h295.2 a4,4 0 0 1 4,4 v16 a4,4 0 0 1 -4,4 h-295.2 Z" fill="#4E80BE" fill-opacity="1.0"/>
+<text x="570.2" y="182" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12.5" font-weight="600" fill="#e6edf3" style="font-variant-numeric:tabular-nums">68.0</text>
+<text x="248" y="219" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12.5" fill="#e6edf3" text-anchor="end">freeToken-rs</text>
+<text x="248" y="234" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#8b949e" text-anchor="end">first working build</text>
+<path d="M263,210 h66.4 a4,4 0 0 1 4,4 v16 a4,4 0 0 1 -4,4 h-66.4 Z" fill="#C96A38" fill-opacity="0.5"/>
+<text x="341.4" y="226" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12.5" font-weight="600" fill="#e6edf3" style="font-variant-numeric:tabular-nums">16.0</text>
+</svg>

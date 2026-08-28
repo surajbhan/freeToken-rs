@@ -33,6 +33,11 @@ finish together.
 
 **Full-model decode** (end-to-end generation, real routing, single stream):
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/bench-4060ti-dark.svg">
+  <img alt="Decode throughput on RTX 4060 Ti: Python FreeToken native accel 91.8 tok/s, freeToken-rs current 76.1, Python Triton fallback 68.0, freeToken-rs first build 16.0" src="docs/bench-4060ti-light.svg" width="760">
+</picture>
+
 | engine | tok/s | ms/token | notes |
 |---|---|---|---|
 | freeToken-rs, first working build | 16.0 | 63 | CPU attention, f32 kernels |
@@ -60,6 +65,11 @@ The two-phase fetch matters most when VRAM is short: at 1200 slots (31% of
 the 3840 expert banks resident) decode improved 29.9 -> **46.6 tok/s**,
 because a missed expert now crosses PCIe once by DMA instead of being read
 in-kernel over UVA by both pair GEMVs while blocking SMs.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/bench-1650-dark.svg">
+  <img alt="Decode throughput on GTX 1650 4 GB laptop: freeToken-rs hybrid co-execution 8.9 tok/s, freeToken-rs GPU fetch-on-miss 5.2, Python FreeToken cannot run (needs driver 580)" src="docs/bench-1650-light.svg" width="760">
+</picture>
 
 **GPU-poor hardware** (GTX 1650 4 GB laptop, driver 535): freeToken-rs runs the
 same 26B model at **8.9 tok/s** in hybrid mode (280-slot cache, CPU experts +
