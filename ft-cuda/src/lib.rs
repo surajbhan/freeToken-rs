@@ -96,6 +96,8 @@ pub struct Q4Gemv {
     topk: CudaFunction,
     admit: CudaFunction,
     promote: CudaFunction,
+    q4r_idx: CudaFunction,
+    q4r_ptr: CudaFunction,
 }
 
 /// bytes per 32-element q8 activation block (f32 d, f32 s, 32x i8)
@@ -134,7 +136,9 @@ impl Q4Gemv {
         let topk = module.load_function("topk_router")?;
         let admit = module.load_function("lru_admit")?;
         let promote = module.load_function("promote_experts")?;
-        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn, grouped_v3_idx, reduce_pairs, rmsnorm_rows, add_rows, rmsnorm_heads, rope_heads, kv_append, attn_batch, dual_combine, gemv_f32, gather, grouped_v3_ptr, sample, topk, admit, promote })
+        let q4r_idx = module.load_function("gemv_q4r_grouped_idx")?;
+        let q4r_ptr = module.load_function("gemv_q4r_grouped_ptr")?;
+        Ok(Self { func, silu_mul, axpy, grouped, silu_grouped, reduce, q6k, gelu_grouped, reduce_ew, quant_q8, grouped_v3, q6k_q8, attn, grouped_v3_idx, reduce_pairs, rmsnorm_rows, add_rows, rmsnorm_heads, rope_heads, kv_append, attn_batch, dual_combine, gemv_f32, gather, grouped_v3_ptr, sample, topk, admit, promote, q4r_idx, q4r_ptr })
     }
 
     /// One launch computing y[e] = W_e x_e for every routed expert of a layer.
@@ -600,6 +604,79 @@ impl Q4Gemv {
         };
         let mut lb = stream.launch_builder(&self.gemv_f32);
         lb.arg(w).arg(x).arg(y).arg(&d).arg(&nr);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+
+    /// q4r (repacked, coalesced) grouped GEMV with activation indirection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q4r_idx(
+        &self,
+        stream: &Arc<CudaStream>,
+        cache: &CudaSlice<u8>,
+        expert_bytes: usize,
+        bank_off: usize,
+        slots: &CudaSlice<i32>,
+        x_idx: &CudaSlice<i32>,
+        n_entries: usize,
+        q8: &CudaSlice<u8>,
+        q8_stride_blocks: usize,
+        y: &mut CudaSlice<f32>,
+        y_stride: usize,
+        n_rows: usize,
+        k: usize,
+        row_bytes_r: usize,
+        qs_off: usize,
+    ) -> Result<()> {
+        assert_eq!(k % 32, 0);
+        let nblocks = k / 32;
+        let (eb, off) = (expert_bytes as u64, bank_off as u64);
+        let (qs, ys, nr, ki) = (q8_stride_blocks as i32, y_stride as i32, n_rows as i32, k as i32);
+        let (rb, qo) = (row_bytes_r as i32, qs_off as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows.div_ceil(8) as u32, n_entries as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (nblocks * Q8_BLK) as u32,
+        };
+        let mut lb = stream.launch_builder(&self.q4r_idx);
+        lb.arg(cache).arg(&eb).arg(&off).arg(slots).arg(x_idx).arg(q8).arg(&qs)
+            .arg(y).arg(&ys).arg(&nr).arg(&ki).arg(&rb).arg(&qo);
+        unsafe { lb.launch(cfg)? };
+        Ok(())
+    }
+
+    /// q4r grouped GEMV over per-entry base pointers (UVA-capable).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q4r_ptr(
+        &self,
+        stream: &Arc<CudaStream>,
+        bases: &CudaSlice<u64>,
+        bank_off: usize,
+        x_idx: &CudaSlice<i32>,
+        n_entries: usize,
+        q8: &CudaSlice<u8>,
+        q8_stride_blocks: usize,
+        y: &mut CudaSlice<f32>,
+        y_stride: usize,
+        n_rows: usize,
+        k: usize,
+        row_bytes_r: usize,
+        qs_off: usize,
+    ) -> Result<()> {
+        assert_eq!(k % 32, 0);
+        let nblocks = k / 32;
+        let off = bank_off as u64;
+        let (qs, ys, nr, ki) = (q8_stride_blocks as i32, y_stride as i32, n_rows as i32, k as i32);
+        let (rb, qo) = (row_bytes_r as i32, qs_off as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows.div_ceil(8) as u32, n_entries as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (nblocks * Q8_BLK) as u32,
+        };
+        let mut lb = stream.launch_builder(&self.q4r_ptr);
+        lb.arg(bases).arg(&off).arg(x_idx).arg(q8).arg(&qs)
+            .arg(y).arg(&ys).arg(&nr).arg(&ki).arg(&rb).arg(&qo);
         unsafe { lb.launch(cfg)? };
         Ok(())
     }

@@ -109,6 +109,22 @@ impl Config {
     }
 }
 
+/// Repack a q4_0 tensor [n_rows, k] into the coalesced q4r layout.
+fn repack_q4r(src: &[u8], n_rows: usize, k: usize) -> Vec<u8> {
+    let rb = q4_0::row_bytes(k);
+    let rbr = q4_0::q4r_row_bytes(k);
+    assert_eq!(src.len(), n_rows * rb);
+    let mut out = vec![0u8; n_rows * rbr];
+    out.par_chunks_exact_mut(rbr)
+        .enumerate()
+        .for_each(|(r, dst)| q4_0::repack_row_q4r(&src[r * rb..(r + 1) * rb], dst, k));
+    out
+}
+
+fn q4r_geom(k: usize) -> (usize, usize) {
+    (q4_0::q4r_row_bytes(k), q4_0::q4r_scales_bytes(k))
+}
+
 /// Dequantize any small f32/f16/q4_0 gguf tensor to Vec<f32>.
 fn to_f32(g: &Gguf, name: &str) -> Result<Vec<f32>> {
     let t = g.tensor(name)?;
@@ -318,6 +334,7 @@ pub struct Model {
     want_sample: bool,
     /// fully device-side routing/admission (graph-compatible path)
     pub gpu_routing: bool,
+    pub sync_prof: bool,
     n_slots: usize,
     lru_map: CudaSlice<i32>,
     lru_slot_key: CudaSlice<i32>,
@@ -454,18 +471,26 @@ impl Model {
             qkv_host.extend_from_slice(qd);
             qkv_host.extend_from_slice(kd);
             qkv_host.extend_from_slice(vd);
-            let qkv = stream.memcpy_stod(&qkv_host)?;
             let qkv_rows = q_rows + 2 * kv_rows;
+            let qkv = stream.memcpy_stod(&repack_q4r(&qkv_host, qkv_rows, HIDDEN))?;
 
-            let o = stream.memcpy_stod(g.tensor_data(&t("attn_output.weight"))?)?;
+            let o = stream.memcpy_stod(&repack_q4r(
+                g.tensor_data(&t("attn_output.weight"))?,
+                HIDDEN,
+                q_rows,
+            ))?;
 
             let gd = g.tensor_data(&t("ffn_gate.weight"))?;
             let ud = g.tensor_data(&t("ffn_up.weight"))?;
             let mut gu_host = Vec::with_capacity(gd.len() + ud.len());
             gu_host.extend_from_slice(gd);
             gu_host.extend_from_slice(ud);
-            let gate_up = stream.memcpy_stod(&gu_host)?;
-            let down = stream.memcpy_stod(g.tensor_data(&t("ffn_down.weight"))?)?;
+            let gate_up = stream.memcpy_stod(&repack_q4r(&gu_host, 2 * cfg.ffn, HIDDEN))?;
+            let down = stream.memcpy_stod(&repack_q4r(
+                g.tensor_data(&t("ffn_down.weight"))?,
+                HIDDEN,
+                cfg.ffn,
+            ))?;
 
             let attn_norm = to_f32(g, &t("attn_norm.weight"))?;
             let q_norm = to_f32(g, &t("attn_q_norm.weight"))?;
@@ -536,14 +561,16 @@ impl Model {
                 q6k::dequantize_row(&embed_cpu[r * erb6..(r + 1) * erb6], &mut row);
                 q4_0::quantize_row(&row, dst);
             });
-        let lm_head_q4 = stream.memcpy_stod(&lm_q4)?;
+        let lm_head_q4 = stream.memcpy_stod(&repack_q4r(&lm_q4, cfg.vocab, HIDDEN))?;
         drop(lm_q4);
         let final_norm = to_f32(g, "output_norm.weight")?;
 
-        // MoE expert banks
+        // MoE expert banks (repacked q4r layout)
         let gu_rows = 2 * cfg.moe_inter;
-        let gu_bytes = rb_h * gu_rows;
-        let down_bytes = q4_0::row_bytes(cfg.moe_inter) * HIDDEN;
+        let gu_bytes_src = rb_h * gu_rows;
+        let down_bytes_src = q4_0::row_bytes(cfg.moe_inter) * HIDDEN;
+        let gu_bytes = q4_0::q4r_row_bytes(HIDDEN) * gu_rows;
+        let down_bytes = q4_0::q4r_row_bytes(cfg.moe_inter) * HIDDEN;
         let eb = gu_bytes + down_bytes;
         let mut banks = HostBanks::new(ctx, cfg.n_layers * cfg.n_experts * eb)?;
         {
@@ -551,12 +578,31 @@ impl Model {
             for l in 0..cfg.n_layers {
                 let gu = g.tensor_data(&format!("blk.{l}.ffn_gate_up_exps.weight"))?;
                 let dn = g.tensor_data(&format!("blk.{l}.ffn_down_exps.weight"))?;
-                for e in 0..cfg.n_experts {
-                    let dst =
-                        &mut hs[(l * cfg.n_experts + e) * eb..(l * cfg.n_experts + e + 1) * eb];
-                    dst[..gu_bytes].copy_from_slice(&gu[e * gu_bytes..(e + 1) * gu_bytes]);
-                    dst[gu_bytes..].copy_from_slice(&dn[e * down_bytes..(e + 1) * down_bytes]);
-                }
+                hs[l * cfg.n_experts * eb..(l + 1) * cfg.n_experts * eb]
+                    .par_chunks_exact_mut(eb)
+                    .enumerate()
+                    .for_each(|(e, dst)| {
+                        let gsrc = &gu[e * gu_bytes_src..(e + 1) * gu_bytes_src];
+                        let dsrc = &dn[e * down_bytes_src..(e + 1) * down_bytes_src];
+                        let rb = q4_0::row_bytes(HIDDEN);
+                        let rbr = q4_0::q4r_row_bytes(HIDDEN);
+                        for r in 0..gu_rows {
+                            q4_0::repack_row_q4r(
+                                &gsrc[r * rb..(r + 1) * rb],
+                                &mut dst[r * rbr..(r + 1) * rbr],
+                                HIDDEN,
+                            );
+                        }
+                        let rb2 = q4_0::row_bytes(cfg.moe_inter);
+                        let rbr2 = q4_0::q4r_row_bytes(cfg.moe_inter);
+                        for r in 0..HIDDEN {
+                            q4_0::repack_row_q4r(
+                                &dsrc[r * rb2..(r + 1) * rb2],
+                                &mut dst[gu_bytes + r * rbr2..gu_bytes + (r + 1) * rbr2],
+                                cfg.moe_inter,
+                            );
+                        }
+                    });
             }
         }
         let moe = MoeEngine {
@@ -625,6 +671,7 @@ impl Model {
             tok_out_dev: stream.alloc_zeros::<i32>(max_batch)?,
             want_sample: false,
             gpu_routing: false,
+            sync_prof: std::env::var("FT_SYNCPROF").is_ok(),
             n_slots: cache_slots,
             lru_map: {
                 let v = vec![-1i32; cfg.n_layers * cfg.n_experts];
@@ -738,10 +785,13 @@ impl Model {
             {
                 let q8 = self.q8bufs.get(&HIDDEN).unwrap();
                 let yd = self.ybufs.get_mut(&qkv_rows).unwrap();
-                self.gemv.gemv_grouped_q8_idx(
-                    &self.stream, &self.layers[l].qkv, 0, 0, &self.zeros_b, &self.dense_idx,
-                    nb, q8, HIDDEN / 32, yd, qkv_rows, qkv_rows, HIDDEN,
-                )?;
+                {
+                    let (rbr, qo) = q4r_geom(HIDDEN);
+                    self.gemv.gemv_q4r_idx(
+                        &self.stream, &self.layers[l].qkv, 0, 0, &self.zeros_b, &self.dense_idx,
+                        nb, q8, HIDDEN / 32, yd, qkv_rows, qkv_rows, HIDDEN, rbr, qo,
+                    )?;
+                }
             }
             {
                 let yd = self.ybufs.get_mut(&qkv_rows).unwrap();
@@ -810,10 +860,13 @@ impl Model {
             {
                 let q8 = self.q8bufs.get(&q_rows).unwrap();
                 let yd = self.ybufs.get_mut(&HIDDEN).unwrap();
-                self.gemv.gemv_grouped_q8_idx(
-                    &self.stream, &self.layers[l].o, 0, 0, &self.zeros_b, &self.dense_idx,
-                    nb, q8, q_rows / 32, yd, HIDDEN, HIDDEN, q_rows,
-                )?;
+                {
+                    let (rbr, qo) = q4r_geom(q_rows);
+                    self.gemv.gemv_q4r_idx(
+                        &self.stream, &self.layers[l].o, 0, 0, &self.zeros_b, &self.dense_idx,
+                        nb, q8, q_rows / 32, yd, HIDDEN, HIDDEN, q_rows, rbr, qo,
+                    )?;
+                }
             }
             {
                 let yd = self.ybufs.get(&HIDDEN).unwrap();
@@ -838,10 +891,13 @@ impl Model {
                 .quantize_q8(&self.stream, &self.sc_pf, HIDDEN, &mut self.q8_preff, HIDDEN, nb)?;
             {
                 let yd = self.ybufs.get_mut(&gu_rows).unwrap();
-                self.gemv.gemv_grouped_q8_idx(
-                    &self.stream, &self.layers[l].gate_up, 0, 0, &self.zeros_b, &self.dense_idx,
-                    nb, &self.q8_preff, HIDDEN / 32, yd, gu_rows, gu_rows, HIDDEN,
-                )?;
+                {
+                    let (rbr, qo) = q4r_geom(HIDDEN);
+                    self.gemv.gemv_q4r_idx(
+                        &self.stream, &self.layers[l].gate_up, 0, 0, &self.zeros_b, &self.dense_idx,
+                        nb, &self.q8_preff, HIDDEN / 32, yd, gu_rows, gu_rows, HIDDEN, rbr, qo,
+                    )?;
+                }
             }
             {
                 let yd = self.ybufs.get(&gu_rows).unwrap();
@@ -856,10 +912,13 @@ impl Model {
             {
                 let q8a = self.q8bufs.get(&cfg.ffn).unwrap();
                 let yd = self.ybufs.get_mut(&HIDDEN).unwrap();
-                self.gemv.gemv_grouped_q8_idx(
-                    &self.stream, &self.layers[l].down, 0, 0, &self.zeros_b, &self.dense_idx,
-                    nb, q8a, cfg.ffn / 32, yd, HIDDEN, HIDDEN, cfg.ffn,
-                )?;
+                {
+                    let (rbr, qo) = q4r_geom(cfg.ffn);
+                    self.gemv.gemv_q4r_idx(
+                        &self.stream, &self.layers[l].down, 0, 0, &self.zeros_b, &self.dense_idx,
+                        nb, q8a, cfg.ffn / 32, yd, HIDDEN, HIDDEN, cfg.ffn, rbr, qo,
+                    )?;
+                }
             }
             self.gemv
                 .rmsnorm_rows_dev(&self.stream, &self.x_res, None, &mut self.sc_a, HIDDEN, cfg.eps, nb)?;
@@ -873,10 +932,6 @@ impl Model {
                 &self.stream, &self.router_logits_dev, &self.layers[l].expert_scale_d,
                 &mut self.moe_ids_dev, &mut self.pair_wts, cfg.n_experts, cfg.topk, nb,
             )?;
-            if let Some(ev) = self.pending_fetch.take() {
-                self.stream.wait(&ev)?;
-                self.captured_events.push(ev);
-            }
             self.gemv.lru_admit_dev(
                 &self.stream, &self.moe_ids_dev, l, cfg.n_experts, self.n_slots,
                 self.cache_dptr, self.banks_dptr, self.moe.eb,
@@ -899,11 +954,14 @@ impl Model {
                 self.stream.memset_zeros(&mut r)?;
             }
             let gu_rows_e = 2 * cfg.moe_inter;
-            self.gemv.gemv_grouped_q8_ptr(
-                &self.stream, &self.pair_bases, 0, &self.pair_xidx, n_pairs,
-                &self.q8_routed, HIDDEN / 32, &mut self.pair_y_gu, gu_rows_e,
-                gu_rows_e, HIDDEN,
-            )?;
+            {
+                let (rbr, qo) = q4r_geom(HIDDEN);
+                self.gemv.gemv_q4r_ptr(
+                    &self.stream, &self.pair_bases, 0, &self.pair_xidx, n_pairs,
+                    &self.q8_routed, HIDDEN / 32, &mut self.pair_y_gu, gu_rows_e,
+                    gu_rows_e, HIDDEN, rbr, qo,
+                )?;
+            }
             self.gemv.gelu_mul_grouped(
                 &self.stream, &self.pair_y_gu, &mut self.pair_act, cfg.moe_inter, n_pairs,
             )?;
@@ -911,11 +969,14 @@ impl Model {
                 &self.stream, &self.pair_act, cfg.moe_inter, &mut self.pair_act_q8,
                 cfg.moe_inter, n_pairs,
             )?;
-            self.gemv.gemv_grouped_q8_ptr(
-                &self.stream, &self.pair_bases, self.moe.gu_bytes, &self.dense_idx,
-                n_pairs, &self.pair_act_q8, cfg.moe_inter / 32, &mut self.pair_y_down,
-                HIDDEN, HIDDEN, cfg.moe_inter,
-            )?;
+            {
+                let (rbr, qo) = q4r_geom(cfg.moe_inter);
+                self.gemv.gemv_q4r_ptr(
+                    &self.stream, &self.pair_bases, self.moe.gu_bytes, &self.dense_idx,
+                    n_pairs, &self.pair_act_q8, cfg.moe_inter / 32, &mut self.pair_y_down,
+                    HIDDEN, HIDDEN, cfg.moe_inter, rbr, qo,
+                )?;
+            }
             self.gemv.reduce_pairs_weighted(
                 &self.stream, &self.pair_y_down, &self.pair_wts, &self.pair_seq,
                 &mut self.routed_out_dev, HIDDEN, n_pairs, nb,
@@ -930,7 +991,8 @@ impl Model {
                 )?;
             }
         }
-        // join the last layer's promote before finishing the step
+        // rejoin the promote fork (capture must not end with a dangling
+        // branch); only the final layer's promote can still be in flight here
         if let Some(ev) = self.pending_fetch.take() {
             self.stream.wait(&ev)?;
             self.captured_events.push(ev);
@@ -942,11 +1004,14 @@ impl Model {
         )?;
         self.gemv
             .quantize_q8(&self.stream, &self.sc_a, HIDDEN, &mut self.q8_preff, HIDDEN, nb)?;
-        self.gemv.gemv_grouped_q8_idx(
-            &self.stream, &self.lm_head_q4, 0, 0, &self.zeros_b, &self.dense_idx,
-            nb, &self.q8_preff, HIDDEN / 32, &mut self.logits_dev, cfg.vocab,
-            cfg.vocab, HIDDEN,
-        )?;
+        {
+            let (rbr, qo) = q4r_geom(HIDDEN);
+            self.gemv.gemv_q4r_idx(
+                &self.stream, &self.lm_head_q4, 0, 0, &self.zeros_b, &self.dense_idx,
+                nb, &self.q8_preff, HIDDEN / 32, &mut self.logits_dev, cfg.vocab,
+                cfg.vocab, HIDDEN, rbr, qo,
+            )?;
+        }
         self.gemv.sample_tokens_dev(
             &self.stream, &self.logits_dev, &self.temps_dev, &mut self.rng_dev,
             &mut self.tok_out_dev, cfg.vocab, cfg.softcap, nb,
@@ -1066,6 +1131,12 @@ impl Model {
                 self.graph_exec[nb] = exec as usize;
             }
         }
+        // a slot promoted during the previous replay must be settled before
+        // any admit in this replay can hand it out as a hit
+        if let Some(ev) = self.pending_fetch.take() {
+            self.stream.wait(&ev)?;
+            self.captured_events.push(ev);
+        }
         unsafe {
             let raw = cudarc::driver::sys::CUstream::from(self.stream.cu_stream());
             let rc = cus::cuGraphLaunch(self.graph_exec[nb] as cus::CUgraphExec, raw);
@@ -1114,9 +1185,13 @@ impl Model {
         let cfg = self.cfg.clone();
         let nb = reqs.len();
         anyhow::ensure!(nb >= 1 && nb <= self.max_batch, "bad batch size");
+        let sync_prof = self.sync_prof;
         let mut t = Instant::now();
         macro_rules! lap {
             ($field:ident) => {{
+                if sync_prof {
+                    self.stream.synchronize()?;
+                }
                 let now = Instant::now();
                 self.prof.$field += now.duration_since(t).as_micros() as u64;
                 t = now;
@@ -1213,10 +1288,13 @@ impl Model {
             {
                 let q8 = self.q8bufs.get(&HIDDEN).unwrap();
                 let yd = self.ybufs.get_mut(&qkv_rows).unwrap();
-                self.gemv.gemv_grouped_q8_idx(
-                    &self.stream, &self.layers[l].qkv, 0, 0, &self.zeros_b, &self.dense_idx,
-                    nb, q8, HIDDEN / 32, yd, qkv_rows, qkv_rows, HIDDEN,
-                )?;
+                {
+                    let (rbr, qo) = q4r_geom(HIDDEN);
+                    self.gemv.gemv_q4r_idx(
+                        &self.stream, &self.layers[l].qkv, 0, 0, &self.zeros_b, &self.dense_idx,
+                        nb, q8, HIDDEN / 32, yd, qkv_rows, qkv_rows, HIDDEN, rbr, qo,
+                    )?;
+                }
             }
             {
                 let yd = self.ybufs.get_mut(&qkv_rows).unwrap();
@@ -1290,10 +1368,13 @@ impl Model {
             {
                 let q8 = self.q8bufs.get(&q_rows).unwrap();
                 let yd = self.ybufs.get_mut(&HIDDEN).unwrap();
-                self.gemv.gemv_grouped_q8_idx(
-                    &self.stream, &self.layers[l].o, 0, 0, &self.zeros_b, &self.dense_idx,
-                    nb, q8, q_rows / 32, yd, HIDDEN, HIDDEN, q_rows,
-                )?;
+                {
+                    let (rbr, qo) = q4r_geom(q_rows);
+                    self.gemv.gemv_q4r_idx(
+                        &self.stream, &self.layers[l].o, 0, 0, &self.zeros_b, &self.dense_idx,
+                        nb, q8, q_rows / 32, yd, HIDDEN, HIDDEN, q_rows, rbr, qo,
+                    )?;
+                }
             }
             {
                 let yd = self.ybufs.get(&HIDDEN).unwrap();
@@ -1322,10 +1403,13 @@ impl Model {
                 .quantize_q8(&self.stream, &self.sc_pf, HIDDEN, &mut self.q8_preff, HIDDEN, nb)?;
             {
                 let yd = self.ybufs.get_mut(&gu_rows).unwrap();
-                self.gemv.gemv_grouped_q8_idx(
-                    &self.stream, &self.layers[l].gate_up, 0, 0, &self.zeros_b, &self.dense_idx,
-                    nb, &self.q8_preff, HIDDEN / 32, yd, gu_rows, gu_rows, HIDDEN,
-                )?;
+                {
+                    let (rbr, qo) = q4r_geom(HIDDEN);
+                    self.gemv.gemv_q4r_idx(
+                        &self.stream, &self.layers[l].gate_up, 0, 0, &self.zeros_b, &self.dense_idx,
+                        nb, &self.q8_preff, HIDDEN / 32, yd, gu_rows, gu_rows, HIDDEN, rbr, qo,
+                    )?;
+                }
             }
             {
                 let yd = self.ybufs.get(&gu_rows).unwrap();
@@ -1340,10 +1424,13 @@ impl Model {
             {
                 let q8a = self.q8bufs.get(&cfg.ffn).unwrap();
                 let yd = self.ybufs.get_mut(&HIDDEN).unwrap();
-                self.gemv.gemv_grouped_q8_idx(
-                    &self.stream, &self.layers[l].down, 0, 0, &self.zeros_b, &self.dense_idx,
-                    nb, q8a, cfg.ffn / 32, yd, HIDDEN, HIDDEN, cfg.ffn,
-                )?;
+                {
+                    let (rbr, qo) = q4r_geom(cfg.ffn);
+                    self.gemv.gemv_q4r_idx(
+                        &self.stream, &self.layers[l].down, 0, 0, &self.zeros_b, &self.dense_idx,
+                        nb, q8a, cfg.ffn / 32, yd, HIDDEN, HIDDEN, cfg.ffn, rbr, qo,
+                    )?;
+                }
             }
             // router: unscaled rms + folded-weight f32 gemv
             self.gemv
@@ -1362,6 +1449,7 @@ impl Model {
                     &self.stream, &self.router_logits_dev, &self.layers[l].expert_scale_d,
                     &mut self.moe_ids_dev, &mut self.pair_wts, cfg.n_experts, cfg.topk, nb,
                 )?;
+                lap!(router_us);
                 if let Some(ev) = self.pending_fetch.take() {
                     self.stream.wait(&ev)?;
                 }
@@ -1379,6 +1467,7 @@ impl Model {
                     self.banks_dptr, self.cache_dptr, self.moe.eb, nb * cfg.topk,
                 )?;
                 self.pending_fetch = Some(self.copy_stream.record_event(None)?);
+                lap!(embed_us); // reused: admit+promote cost bucket
 
                 let n_pairs = nb * cfg.topk;
                 {
@@ -1386,11 +1475,14 @@ impl Model {
                     self.stream.memset_zeros(&mut r)?;
                 }
                 let gu_rows_e = 2 * cfg.moe_inter;
-                self.gemv.gemv_grouped_q8_ptr(
-                    &self.stream, &self.pair_bases, 0, &self.pair_xidx, n_pairs,
-                    &self.q8_routed, HIDDEN / 32, &mut self.pair_y_gu, gu_rows_e,
-                    gu_rows_e, HIDDEN,
-                )?;
+                {
+                    let (rbr, qo) = q4r_geom(HIDDEN);
+                    self.gemv.gemv_q4r_ptr(
+                        &self.stream, &self.pair_bases, 0, &self.pair_xidx, n_pairs,
+                        &self.q8_routed, HIDDEN / 32, &mut self.pair_y_gu, gu_rows_e,
+                        gu_rows_e, HIDDEN, rbr, qo,
+                    )?;
+                }
                 self.gemv.gelu_mul_grouped(
                     &self.stream, &self.pair_y_gu, &mut self.pair_act, cfg.moe_inter, n_pairs,
                 )?;
@@ -1398,11 +1490,14 @@ impl Model {
                     &self.stream, &self.pair_act, cfg.moe_inter, &mut self.pair_act_q8,
                     cfg.moe_inter, n_pairs,
                 )?;
-                self.gemv.gemv_grouped_q8_ptr(
-                    &self.stream, &self.pair_bases, self.moe.gu_bytes, &self.dense_idx,
-                    n_pairs, &self.pair_act_q8, cfg.moe_inter / 32, &mut self.pair_y_down,
-                    HIDDEN, HIDDEN, cfg.moe_inter,
-                )?;
+                {
+                    let (rbr, qo) = q4r_geom(cfg.moe_inter);
+                    self.gemv.gemv_q4r_ptr(
+                        &self.stream, &self.pair_bases, self.moe.gu_bytes, &self.dense_idx,
+                        n_pairs, &self.pair_act_q8, cfg.moe_inter / 32, &mut self.pair_y_down,
+                        HIDDEN, HIDDEN, cfg.moe_inter, rbr, qo,
+                    )?;
+                }
                 self.gemv.reduce_pairs_weighted(
                     &self.stream, &self.pair_y_down, &self.pair_wts, &self.pair_seq,
                     &mut self.routed_out_dev, HIDDEN, n_pairs, nb,
@@ -1526,11 +1621,14 @@ impl Model {
                     self.stream.memcpy_htod(&self.pair_seq_h, &mut qd)?;
                 }
                 let gu_rows_e = 2 * cfg.moe_inter;
-                self.gemv.gemv_grouped_q8_ptr(
-                    &self.stream, &self.pair_bases, 0, &self.pair_xidx, n_pairs,
-                    &self.q8_routed, HIDDEN / 32, &mut self.pair_y_gu, gu_rows_e,
-                    gu_rows_e, HIDDEN,
-                )?;
+                {
+                    let (rbr, qo) = q4r_geom(HIDDEN);
+                    self.gemv.gemv_q4r_ptr(
+                        &self.stream, &self.pair_bases, 0, &self.pair_xidx, n_pairs,
+                        &self.q8_routed, HIDDEN / 32, &mut self.pair_y_gu, gu_rows_e,
+                        gu_rows_e, HIDDEN, rbr, qo,
+                    )?;
+                }
                 self.gemv.gelu_mul_grouped(
                     &self.stream, &self.pair_y_gu, &mut self.pair_act, cfg.moe_inter, n_pairs,
                 )?;
@@ -1538,11 +1636,14 @@ impl Model {
                     &self.stream, &self.pair_act, cfg.moe_inter, &mut self.pair_act_q8,
                     cfg.moe_inter, n_pairs,
                 )?;
-                self.gemv.gemv_grouped_q8_ptr(
-                    &self.stream, &self.pair_bases, self.moe.gu_bytes, &self.dense_idx,
-                    n_pairs, &self.pair_act_q8, cfg.moe_inter / 32, &mut self.pair_y_down,
-                    HIDDEN, HIDDEN, cfg.moe_inter,
-                )?;
+                {
+                    let (rbr, qo) = q4r_geom(cfg.moe_inter);
+                    self.gemv.gemv_q4r_ptr(
+                        &self.stream, &self.pair_bases, self.moe.gu_bytes, &self.dense_idx,
+                        n_pairs, &self.pair_act_q8, cfg.moe_inter / 32, &mut self.pair_y_down,
+                        HIDDEN, HIDDEN, cfg.moe_inter, rbr, qo,
+                    )?;
+                }
                 self.gemv.reduce_pairs_weighted(
                     &self.stream, &self.pair_y_down, &self.pair_wts, &self.pair_seq,
                     &mut self.routed_out_dev, HIDDEN, n_pairs, nb,
@@ -1564,13 +1665,17 @@ impl Model {
                     .map(|&(i, e, w)| {
                         let off = (l * n_experts + e as usize) * eb;
                         let mut ygu = vec![0f32; 2 * inter];
-                        q4_0::gemv_q8(&banks[off..off + gu_bytes], &x8s[i], &mut ygu);
+                        q4_0::gemv_q8_r(&banks[off..off + gu_bytes], &x8s[i], &mut ygu);
                         let mut act = vec![0f32; inter];
                         for j in 0..inter {
                             act[j] = gelu_tanh(ygu[j]) * ygu[j + inter];
                         }
                         let mut ydn = vec![0f32; HIDDEN];
-                        q4_0::gemv(&banks[off + gu_bytes..off + eb], &act, &mut ydn);
+                        q4_0::gemv_q8_r(
+                            &banks[off + gu_bytes..off + eb],
+                            &q4_0::Q8Vec::quantize(&act),
+                            &mut ydn,
+                        );
                         for v in ydn.iter_mut() {
                             *v *= w;
                         }
@@ -1611,11 +1716,14 @@ impl Model {
         )?;
         self.gemv
             .quantize_q8(&self.stream, &self.sc_a, HIDDEN, &mut self.q8_preff, HIDDEN, nb)?;
-        self.gemv.gemv_grouped_q8_idx(
-            &self.stream, &self.lm_head_q4, 0, 0, &self.zeros_b, &self.dense_idx,
-            nb, &self.q8_preff, HIDDEN / 32, &mut self.logits_dev, cfg.vocab,
-            cfg.vocab, HIDDEN,
-        )?;
+        {
+            let (rbr, qo) = q4r_geom(HIDDEN);
+            self.gemv.gemv_q4r_idx(
+                &self.stream, &self.lm_head_q4, 0, 0, &self.zeros_b, &self.dense_idx,
+                nb, &self.q8_preff, HIDDEN / 32, &mut self.logits_dev, cfg.vocab,
+                cfg.vocab, HIDDEN, rbr, qo,
+            )?;
+        }
         lap!(combine_us);
         let cap = cfg.softcap;
         let mut out = Vec::with_capacity(nb);

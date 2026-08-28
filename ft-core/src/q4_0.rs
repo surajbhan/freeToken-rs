@@ -230,3 +230,130 @@ mod tests {
         assert!((a - b).abs() < 1e-2 * (1.0 + a.abs()), "scalar {a} avx2 {b}");
     }
 }
+
+// ---- q4r: repacked q4_0 for coalesced GPU loads ----
+// Row layout: [ scales: nblocks x f16, padded to 16B ][ qs: nblocks x 16B ].
+// Block-internal byte order is unchanged, so dot math is identical.
+
+pub fn q4r_scales_bytes(k: usize) -> usize {
+    let n = k / QK * 2;
+    (n + 15) / 16 * 16
+}
+
+pub fn q4r_row_bytes(k: usize) -> usize {
+    q4r_scales_bytes(k) + k / QK * 16
+}
+
+/// repack one q4_0 row into q4r layout
+pub fn repack_row_q4r(src: &[u8], dst: &mut [u8], k: usize) {
+    let nb = k / QK;
+    assert_eq!(src.len(), row_bytes(k));
+    assert_eq!(dst.len(), q4r_row_bytes(k));
+    let qs_off = q4r_scales_bytes(k);
+    for b in 0..nb {
+        dst[b * 2..b * 2 + 2].copy_from_slice(&src[b * 18..b * 18 + 2]);
+        dst[qs_off + b * 16..qs_off + (b + 1) * 16]
+            .copy_from_slice(&src[b * 18 + 2..(b + 1) * 18]);
+    }
+}
+
+/// y = W x over a q4r matrix with pre-quantized activations (CPU hybrid path).
+pub fn gemv_q8_r(w: &[u8], x8: &Q8Vec, y: &mut [f32]) {
+    let k = x8.qs.len();
+    let rb = q4r_row_bytes(k);
+    assert_eq!(w.len(), rb * y.len());
+    let use_avx2 = is_x86_feature_detected!("avx2");
+    y.par_iter_mut().enumerate().for_each(|(r, yo)| {
+        let row = &w[r * rb..(r + 1) * rb];
+        *yo = if use_avx2 {
+            unsafe { dot_q4r_q8_avx2(row, x8, k) }
+        } else {
+            dot_q4r_q8_scalar(row, x8, k)
+        };
+    });
+}
+
+fn dot_q4r_q8_scalar(row: &[u8], x8: &Q8Vec, k: usize) -> f32 {
+    let nb = k / QK;
+    let qs_off = q4r_scales_bytes(k);
+    let mut acc = 0.0f32;
+    for b in 0..nb {
+        let d4 = f16::from_le_bytes([row[b * 2], row[b * 2 + 1]]).to_f32();
+        let qs = &row[qs_off + b * 16..qs_off + (b + 1) * 16];
+        let mut s = 0i32;
+        for i in 0..16 {
+            let lo = (qs[i] & 0xF) as i32 - 8;
+            let hi = (qs[i] >> 4) as i32 - 8;
+            s += lo * x8.qs[b * QK + i] as i32 + hi * x8.qs[b * QK + i + 16] as i32;
+        }
+        acc += d4 * x8.d[b] * s as f32;
+    }
+    acc
+}
+
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_q4r_q8_avx2(row: &[u8], x8: &Q8Vec, k: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = k / QK;
+    let qs_off = q4r_scales_bytes(k);
+    let mut acc = _mm256_setzero_ps();
+    let low_mask = _mm256_set1_epi8(0x0F);
+    let ones16 = _mm256_set1_epi16(1);
+    let eights = _mm256_set1_epi8(8);
+    for b in 0..nb {
+        let d4 = f16::from_le_bytes([row[b * 2], row[b * 2 + 1]]).to_f32();
+        let scale = _mm256_set1_ps(d4 * x8.d[b]);
+        let packed = _mm_load_si128(row.as_ptr().add(qs_off + b * 16) as *const __m128i);
+        let q4 = _mm256_and_si256(
+            _mm256_set_m128i(_mm_srli_epi16(packed, 4), packed),
+            low_mask,
+        );
+        let q8 = _mm256_loadu_si256(x8.qs.as_ptr().add(b * QK) as *const __m256i);
+        let prod32 = _mm256_madd_epi16(_mm256_maddubs_epi16(q4, q8), ones16);
+        let off32 = _mm256_madd_epi16(_mm256_maddubs_epi16(eights, q8), ones16);
+        let diff = _mm256_sub_epi32(prod32, off32);
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(diff), scale, acc);
+    }
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let s = _mm_add_ps(lo, hi);
+    let s = _mm_hadd_ps(s, s);
+    let s = _mm_hadd_ps(s, s);
+    _mm_cvtss_f32(s)
+}
+
+#[cfg(test)]
+mod q4r_tests {
+    use super::*;
+
+    #[test]
+    fn q4r_matches_q4() {
+        let k = 2816usize;
+        let n = 8usize;
+        let mut s = 0xC0DEu32;
+        let mut rnd = move || {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            (s as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let mut w = vec![0u8; row_bytes(k) * n];
+        let mut wr = vec![0u8; q4r_row_bytes(k) * n];
+        for r in 0..n {
+            let row: Vec<f32> = (0..k).map(|_| rnd()).collect();
+            quantize_row(&row, &mut w[r * row_bytes(k)..(r + 1) * row_bytes(k)]);
+            repack_row_q4r(
+                &w[r * row_bytes(k)..(r + 1) * row_bytes(k)],
+                &mut wr[r * q4r_row_bytes(k)..(r + 1) * q4r_row_bytes(k)],
+                k,
+            );
+        }
+        let x: Vec<f32> = (0..k).map(|_| rnd()).collect();
+        let x8 = Q8Vec::quantize(&x);
+        let mut y1 = vec![0f32; n];
+        gemv_q8(&w, &x8, &mut y1);
+        let mut y2 = vec![0f32; n];
+        gemv_q8_r(&wr, &x8, &mut y2);
+        for r in 0..n {
+            assert!((y1[r] - y2[r]).abs() < 1e-3 * (1.0 + y1[r].abs()), "{r}: {} {}", y1[r], y2[r]);
+        }
+    }
+}

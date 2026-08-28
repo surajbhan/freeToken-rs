@@ -1163,3 +1163,111 @@ extern "C" __global__ void promote_experts(
          i += (size_t)gridDim.x * blockDim.x)
         dst[i] = src[i];
 }
+
+// ---- q4r: repacked q4_0 (scales-first, 16B-aligned nibble payloads) ----
+// Row: [ nblocks x f16 scales, padded to 16B ][ nblocks x 16B qs ].
+// A warp's lanes load consecutive uint4s -> fully coalesced 512B/step.
+
+// helper shared by the idx/ptr variants
+__device__ __forceinline__ float q4r_row_dot(
+    const unsigned char* __restrict__ wr,
+    const unsigned char* __restrict__ q8s,
+    int nblocks,
+    int qs_off,
+    int lane)
+{
+    const __half* sc = reinterpret_cast<const __half*>(wr);
+    const uint4* qs = reinterpret_cast<const uint4*>(wr + qs_off);
+    float acc = 0.0f;
+    for (int b = lane; b < nblocks; b += 32) {
+        float d4 = __half2float(sc[b]);
+        uint4 g4 = qs[b];
+        const unsigned char* qb = q8s + b * 40;
+        float d8 = *reinterpret_cast<const float*>(qb);
+        float s8 = *reinterpret_cast<const float*>(qb + 4);
+        const int* x8 = reinterpret_cast<const int*>(qb + 8);
+        int isum = 0;
+        unsigned int gg[4] = {g4.x, g4.y, g4.z, g4.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int lo = gg[i] & 0x0F0F0F0Fu;
+            int hi = (gg[i] >> 4) & 0x0F0F0F0Fu;
+            isum = __dp4a(lo, x8[i], isum);
+            isum = __dp4a(hi, x8[4 + i], isum);
+        }
+        acc += d4 * (d8 * (float)isum - 8.0f * s8);
+    }
+    return acc;
+}
+
+extern "C" __global__ void gemv_q4r_grouped_idx(
+    const unsigned char* __restrict__ base,
+    unsigned long long expert_bytes,
+    unsigned long long bank_off,
+    const int* __restrict__ slots,
+    const int* __restrict__ x_idx,
+    const unsigned char* __restrict__ q8,
+    int q8_stride_blocks,
+    float* __restrict__ y,
+    int y_stride,
+    int n_rows,
+    int k,
+    int row_bytes_r,
+    int qs_off)
+{
+    extern __shared__ unsigned char q8s[];
+    int e = blockIdx.y;
+    int nblocks = k / 32;
+    {
+        const unsigned char* src = q8 + (size_t)x_idx[e] * q8_stride_blocks * 40;
+        for (int i = threadIdx.x; i < nblocks * 40 / 4; i += blockDim.x)
+            reinterpret_cast<unsigned int*>(q8s)[i] =
+                reinterpret_cast<const unsigned int*>(src)[i];
+    }
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (row >= n_rows) return;
+    const unsigned char* wr = base + (size_t)slots[e] * expert_bytes + bank_off
+                            + (size_t)row * row_bytes_r;
+    float acc = q4r_row_dot(wr, q8s, nblocks, qs_off, lane);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    if (lane == 0) y[(size_t)e * y_stride + row] = acc;
+}
+
+extern "C" __global__ void gemv_q4r_grouped_ptr(
+    const unsigned long long* __restrict__ bases,
+    unsigned long long bank_off,
+    const int* __restrict__ x_idx,
+    const unsigned char* __restrict__ q8,
+    int q8_stride_blocks,
+    float* __restrict__ y,
+    int y_stride,
+    int n_rows,
+    int k,
+    int row_bytes_r,
+    int qs_off)
+{
+    extern __shared__ unsigned char q8s[];
+    int e = blockIdx.y;
+    int nblocks = k / 32;
+    {
+        const unsigned char* src = q8 + (size_t)x_idx[e] * q8_stride_blocks * 40;
+        for (int i = threadIdx.x; i < nblocks * 40 / 4; i += blockDim.x)
+            reinterpret_cast<unsigned int*>(q8s)[i] =
+                reinterpret_cast<const unsigned int*>(src)[i];
+    }
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (row >= n_rows) return;
+    const unsigned char* wr = reinterpret_cast<const unsigned char*>(bases[e])
+                            + bank_off + (size_t)row * row_bytes_r;
+    float acc = q4r_row_dot(wr, q8s, nblocks, qs_off, lane);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    if (lane == 0) y[(size_t)e * y_stride + row] = acc;
+}
