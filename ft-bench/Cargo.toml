@@ -1,0 +1,13 @@
+[package]
+name = "ft-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ft-core = { path = "../ft-core" }
+cudarc.workspace = true
+rayon.workspace = true
+half.workspace = true
+anyhow.workspace = true
+ft-cuda = { path = "../ft-cuda" }
+ft-gguf = { path = "../ft-gguf" }

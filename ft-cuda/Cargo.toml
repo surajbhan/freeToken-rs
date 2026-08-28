@@ -1,0 +1,12 @@
+[package]
+name = "ft-cuda"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cudarc.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+ft-core = { path = "../ft-core" }
+half.workspace = true

@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["ft-core", "ft-bench", "ft-cuda", "ft-gguf"]
+
+[workspace.dependencies]
+cudarc = { version = "0.19", features = ["cuda-12000"] }
+rayon = "1.10"
+half = "2"
+anyhow = "1"
