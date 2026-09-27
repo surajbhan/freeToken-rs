@@ -137,6 +137,12 @@ impl Tokenizer {
     }
 
     pub fn decode(&self, ids: &[u32]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
+    }
+
+    /// Raw bytes for `ids`; byte-fallback tokens may leave a partial UTF-8
+    /// sequence at the end, which streaming callers must carry over.
+    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
         let mut bytes: Vec<u8> = Vec::new();
         for &id in ids {
             let piece = &self.vocab[id as usize];
@@ -148,7 +154,7 @@ impl Tokenizer {
             }
             bytes.extend(piece.replace('\u{2581}', " ").as_bytes());
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        bytes
     }
 
     /// Gemma-4 canonical chat format for a single user turn (as rendered by

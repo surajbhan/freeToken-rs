@@ -116,6 +116,38 @@ cargo run --release -p ft-bench --bin decode -- gguf=model-q4_0.gguf slots=2048 
     steps=200 warmup=100 fractions=0.0,0.2,1.0 locality=0.9
 ```
 
+## OpenAI-compatible API
+
+`serve` exposes the engine over the OpenAI REST API, so existing clients and SDKs
+work unchanged:
+
+```
+cargo run --release -p ft-model --bin serve -- gguf=model-q4_0.gguf port=8080 batch=4 \
+    [api_key=sk-...]   # or FT_API_KEY; omit for no auth
+```
+
+| endpoint | notes |
+|---|---|
+| `POST /v1/chat/completions` | Gemma-4 chat template; `stream`, `stream_options.include_usage`, `stop` (up to 4), `max_tokens` / `max_completion_tokens`, `temperature` (default 0 = greedy) |
+| `POST /v1/completions` | raw prompt (no template), `echo`, same sampling/stop/stream options; default `max_tokens` 16 |
+| `GET /v1/models`, `GET /v1/models/{id}` | the loaded model, named after the GGUF file stem |
+| `GET /health` | liveness (no auth) |
+
+Responses carry real `usage` token counts and `finish_reason` (`stop` / `length`);
+errors use OpenAI's `{"error": {...}}` shape (e.g. `context_length_exceeded`).
+System/developer messages are folded into the first user turn; content may be a
+string or an array of `text` parts. `n` must be 1; `top_p`, `seed`, tools and other
+unsupported fields are accepted and ignored. CORS is open for browser clients.
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="unused")
+for chunk in client.chat.completions.create(
+        model="model-q4_0", stream=True,
+        messages=[{"role": "user", "content": "Why is the sky blue?"}]):
+    print(chunk.choices[0].delta.content or "", end="")
+```
+
 ## Notes
 
 - Ported from FreeToken (Apache-2.0); expert-cache semantics, q\* policy, and bank
@@ -123,5 +155,4 @@ cargo run --release -p ft-bench --bin decode -- gguf=model-q4_0.gguf slots=2048 
 - Pinned host memory must be allocated with `cuMemHostRegister` on ordinary pages
   (`ft_cuda::HostBanks`), not `CU_MEMHOSTALLOC_WRITECOMBINED` — CPU reads from
   write-combined memory are ~100x slower and the hybrid path reads the same banks.
-- In progress: full Gemma-4 forward pass (attention + tokenizer), AVX-512 CPU GEMV,
-  OpenAI-compatible serving.
+- In progress: full Gemma-4 forward pass (attention + tokenizer), AVX-512 CPU GEMV.

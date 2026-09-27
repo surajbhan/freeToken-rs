@@ -9,6 +9,7 @@
 //! Compute split (correctness-first): dense q4_0 GEMVs + expert FFN + lm_head
 //! on GPU; norms, rope, attention, routing, sampling on CPU (bs=1 decode).
 
+pub mod openai;
 pub mod q6k;
 pub mod tokenizer;
 
